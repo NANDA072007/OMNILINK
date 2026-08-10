@@ -1,0 +1,162 @@
+import 'dart:async';
+import 'package:cryptography/cryptography.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+import '../transport_bridge/android_transport_adapter.dart';
+import '../transport_bridge/transport_adapter.dart';
+import 'crypto/crypto_service.dart';
+import 'crypto/packet_service.dart';
+import 'models/peer_device.dart';
+
+// 1. Core Services
+final cryptoServiceProvider = Provider<CryptoService>((ref) => CryptoService());
+
+final packetServiceProvider = Provider<PacketService>((ref) {
+  return PacketService(cryptoService: ref.watch(cryptoServiceProvider));
+});
+
+// 2. Transport Adapter (Android Native Radio Transport)
+final transportAdapterProvider = Provider<TransportAdapter>((ref) {
+  final adapter = AndroidTransportAdapter();
+  adapter.initialize();
+  ref.onDispose(() => adapter.dispose());
+  return adapter;
+});
+
+// 3. Identity Management (Master Ed25519 Key)
+final secureStorageProvider = Provider<FlutterSecureStorage>((ref) {
+  return const FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock_this_device),
+  );
+});
+
+class IdentityState {
+  final SimpleKeyPair? masterKeyPair;
+  final String? nodeId; // Hex encoded public key
+  final bool isLoading;
+
+  IdentityState({
+    this.masterKeyPair,
+    this.nodeId,
+    this.isLoading = false,
+  });
+
+  IdentityState copyWith({
+    SimpleKeyPair? masterKeyPair,
+    String? nodeId,
+    bool? isLoading,
+  }) {
+    return IdentityState(
+      masterKeyPair: masterKeyPair ?? this.masterKeyPair,
+      nodeId: nodeId ?? this.nodeId,
+      isLoading: isLoading ?? this.isLoading,
+    );
+  }
+}
+
+class IdentityNotifier extends StateNotifier<IdentityState> {
+  final CryptoService _cryptoService;
+  final FlutterSecureStorage _storage;
+  static const _seedKey = 'omnilink_master_ed25519_seed';
+
+  IdentityNotifier(this._cryptoService, this._storage)
+      : super(IdentityState(isLoading: true)) {
+    _initIdentity();
+  }
+
+  Future<void> _initIdentity() async {
+    try {
+      final seedString = await _storage.read(key: _seedKey);
+      SimpleKeyPair keyPair;
+      if (seedString != null) {
+        final seed = List<int>.from(seedString.split(',').map(int.parse));
+        keyPair = await _cryptoService.restoreEd25519KeyPair(seed);
+      } else {
+        keyPair = await _cryptoService.generateEd25519KeyPair();
+        final seed = await _cryptoService.extractEd25519Seed(keyPair);
+        await _storage.write(key: _seedKey, value: seed.join(','));
+      }
+      final nodeId = await _cryptoService.getEd25519PublicKeyHex(keyPair);
+      state = IdentityState(masterKeyPair: keyPair, nodeId: nodeId, isLoading: false);
+    } catch (e) {
+      state = IdentityState(isLoading: false);
+    }
+  }
+}
+
+final identityProvider = StateNotifierProvider<IdentityNotifier, IdentityState>((ref) {
+  return IdentityNotifier(
+    ref.watch(cryptoServiceProvider),
+    ref.watch(secureStorageProvider),
+  );
+});
+
+// 4. Peer Discovery State
+class PeerListNotifier extends StateNotifier<List<PeerDevice>> {
+  final TransportAdapter _adapter;
+  late final StreamSubscription _subscription;
+
+  PeerListNotifier(this._adapter) : super([]) {
+    _subscription = _adapter.peerEvents.listen(_handleEvent);
+  }
+
+  void _handleEvent(PeerConnectionEvent event) {
+    final now = DateTime.now();
+    switch (event.eventType) {
+      case PeerConnectionEventType.onPeerFound:
+        if (!state.any((p) => p.peerId == event.peerId)) {
+          state = [
+            ...state,
+            PeerDevice(
+              peerId: event.peerId,
+              friendlyName: event.friendlyName ?? 'Unknown',
+              lastSeenAt: now,
+              rssi: event.rssi,
+              transportType: event.transportType,
+              connectionStatus: PeerConnectionStatus.discovered,
+            ),
+          ];
+        }
+        break;
+
+      case PeerConnectionEventType.onPeerLost:
+        state = state.where((p) => p.peerId != event.peerId).toList();
+        break;
+
+      case PeerConnectionEventType.onConnected:
+        state = [
+          for (final p in state)
+            if (p.peerId == event.peerId)
+              p.copyWith(connectionStatus: PeerConnectionStatus.connected)
+            else
+              p
+        ];
+        break;
+
+      case PeerConnectionEventType.onDisconnected:
+        state = [
+          for (final p in state)
+            if (p.peerId == event.peerId)
+              p.copyWith(connectionStatus: PeerConnectionStatus.disconnected)
+            else
+              p
+        ];
+        break;
+
+      case PeerConnectionEventType.onError:
+        break;
+    }
+  }
+
+  @override
+  void dispose() {
+    _subscription.cancel();
+    super.dispose();
+  }
+}
+
+final peerListProvider = StateNotifierProvider<PeerListNotifier, List<PeerDevice>>((ref) {
+  return PeerListNotifier(ref.watch(transportAdapterProvider));
+});
