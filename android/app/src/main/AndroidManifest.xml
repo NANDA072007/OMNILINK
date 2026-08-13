@@ -22,6 +22,7 @@
     <!-- Foreground Service Permissions (Android 14+ / API 34+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:label="OMNILINK"
@@ -49,6 +50,11 @@
         <!-- OMNILINK Foreground Service for continuous offline radio listening -->
         <service
             android:name="org.omnilink.transport.OmnilinkForegroundService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <service
+            android:name="org.omnilink.transport.OmnilinkMeshService"
             android:foregroundServiceType="connectedDevice"
             android:exported="false" />
 

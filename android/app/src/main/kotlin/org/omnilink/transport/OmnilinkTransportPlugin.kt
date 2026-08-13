@@ -139,6 +139,30 @@ class OmnilinkTransportPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
             "getAndroidPermissionDetails" -> {
                 result.success(getAndroidPermissionDetails())
             }
+            "startForegroundService" -> {
+                val ctx = context
+                if (ctx != null) {
+                    val intent = android.content.Intent(ctx, OmnilinkForegroundService::class.java)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        ctx.startForegroundService(intent)
+                    } else {
+                        ctx.startService(intent)
+                    }
+                    result.success(true)
+                } else {
+                    result.success(false)
+                }
+            }
+            "stopForegroundService" -> {
+                val ctx = context
+                if (ctx != null) {
+                    val intent = android.content.Intent(ctx, OmnilinkForegroundService::class.java)
+                    ctx.stopService(intent)
+                    result.success(true)
+                } else {
+                    result.success(false)
+                }
+            }
             else -> {
                 result.notImplemented()
             }

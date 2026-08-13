@@ -31,6 +31,30 @@ class AndroidTransportAdapter implements TransportAdapter {
     _eventSubscription = _eventChannel
         .receiveBroadcastStream()
         .listen(_handleNativeEvent, onError: _handleNativeError);
+
+    await startForegroundService();
+  }
+
+  /// Starts the Android 14+ Foreground Service for continuous background mesh listening.
+  Future<bool> startForegroundService() async {
+    try {
+      final result = await _controlChannel.invokeMethod<bool>('startForegroundService');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('OMNILINK_DART: Exception starting Foreground Service: $e');
+      return false;
+    }
+  }
+
+  /// Stops the Android Foreground Service.
+  Future<bool> stopForegroundService() async {
+    try {
+      final result = await _controlChannel.invokeMethod<bool>('stopForegroundService');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('OMNILINK_DART: Exception stopping Foreground Service: $e');
+      return false;
+    }
   }
 
   /// Maps incoming native JSON maps to Dart domain events.
