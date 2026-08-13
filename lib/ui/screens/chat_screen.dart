@@ -9,6 +9,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../core/models/message.dart';
 import '../../core/models/packet_envelope.dart';
+import '../../core/models/peer_device.dart';
 import '../../core/providers.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
@@ -118,24 +119,36 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       return;
     }
 
+    // Ensure Outbox Daemon is active
+    ref.read(outboxDaemonProvider);
+
+    final peerList = ref.read(peerListProvider);
+    final isPeerConnected = peerList.any(
+      (p) => p.peerId == widget.peerId && p.connectionStatus == PeerConnectionStatus.connected,
+    );
+
     final messageId = _uuid.v4();
     final messageRepo = ref.read(messageRepositoryProvider);
     final outboxRepo = ref.read(outboxRepositoryProvider);
 
-    // 1. Create Message record with state MessageState.sending
-    final sendingMessage = Message(
+    // Initial state: sending if connected, queued if offline (Rule #1)
+    final initialMessageState =
+        isPeerConnected ? MessageState.sending : MessageState.queued;
+
+    // 1. Create Message record
+    final draftMessage = Message(
       messageId: messageId,
       conversationId: widget.peerId,
       senderNodeId: myNodeId,
       recipientNodeId: widget.peerId,
       plaintextBody: text,
-      state: MessageState.sending,
+      state: initialMessageState,
       createdAt: DateTime.now(),
       updatedAt: DateTime.now(),
     );
 
     // 2. Save message to SQLite database BEFORE transmitting
-    await messageRepo.saveMessage(sendingMessage);
+    await messageRepo.saveMessage(draftMessage);
     _textController.clear();
     ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
     _scrollToBottom();
@@ -165,23 +178,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         senderKeyPair: masterKeyPair,
       );
 
-      // Serialize envelope to JSON bytes and send via transport
-      final jsonString = envelope.toJson();
-      final packetBytes = Uint8List.fromList(utf8.encode(jsonString));
+      if (isPeerConnected) {
+        // Transmit over native radio transport
+        final jsonString = envelope.toJson();
+        final packetBytes = Uint8List.fromList(utf8.encode(jsonString));
 
-      final adapter = ref.read(transportAdapterProvider);
-      final success = await adapter.sendPacket(widget.peerId, packetBytes);
+        final adapter = ref.read(transportAdapterProvider);
+        final success = await adapter.sendPacket(widget.peerId, packetBytes);
 
-      if (success) {
-        // 3a. Update SQLite message state to delivered
-        await messageRepo.updateMessageState(messageId, MessageState.delivered);
+        if (success) {
+          await messageRepo.updateMessageState(messageId, MessageState.delivered);
+        } else {
+          // Transmission failed -> Save to outbox queue with state MessageState.queued
+          await messageRepo.updateMessageState(messageId, MessageState.queued);
+          await outboxRepo.saveToOutbox(envelope);
+        }
       } else {
-        // 3b. Update SQLite message state to failed and save to outbox queue
-        await messageRepo.updateMessageState(messageId, MessageState.failed);
+        // Peer is offline -> Save signed envelope to outbox_queue table
         await outboxRepo.saveToOutbox(envelope);
       }
     } catch (e) {
-      await messageRepo.updateMessageState(messageId, MessageState.failed);
+      await messageRepo.updateMessageState(messageId, MessageState.queued);
     }
 
     if (mounted) {
@@ -204,10 +221,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Widget _buildStateIcon(MessageState state) {
     switch (state) {
       case MessageState.draft:
-      case MessageState.queued:
       case MessageState.encrypted:
       case MessageState.searchingForPeer:
         return const Text('⏳', style: TextStyle(fontSize: 12));
+      case MessageState.queued:
+        return const Text('⏳ Queued', style: TextStyle(fontSize: 11, color: Colors.orangeAccent));
       case MessageState.sending:
         return const Text('✓', style: TextStyle(fontSize: 12, color: Colors.grey));
       case MessageState.delivered:
@@ -266,7 +284,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                         ),
                         const SizedBox(height: 4),
                         const Text(
-                          'ChaCha20-Poly1305 • Ed25519 Signatures • Mesh Relay Router',
+                          'ChaCha20-Poly1305 • Store-and-Forward Outbox • Mesh Router',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],

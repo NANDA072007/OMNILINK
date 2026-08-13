@@ -14,6 +14,7 @@ import 'repositories/message_repository.dart';
 import 'repositories/outbox_repository.dart';
 import 'repositories/peer_repository.dart';
 import 'routing/mesh_router.dart';
+import 'routing/outbox_daemon.dart';
 
 // 1. Core Services & Database
 final cryptoServiceProvider = Provider<CryptoService>((ref) => CryptoService());
@@ -244,4 +245,16 @@ final meshRouterProvider = Provider<MeshRouter>((ref) {
   );
   ref.onDispose(() => router.dispose());
   return router;
+});
+
+// 7. Store-and-Forward Outbox Daemon
+final outboxDaemonProvider = Provider<OutboxDaemon>((ref) {
+  final daemon = OutboxDaemon(
+    transportAdapter: ref.watch(transportAdapterProvider),
+    outboxRepo: ref.watch(outboxRepositoryProvider),
+    messageRepo: ref.watch(messageRepositoryProvider),
+    packetService: ref.watch(packetServiceProvider),
+  );
+  ref.onDispose(() => daemon.dispose());
+  return daemon;
 });
