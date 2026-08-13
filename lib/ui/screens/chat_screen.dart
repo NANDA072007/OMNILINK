@@ -54,6 +54,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   /// Handles incoming raw byte packet from native transport layer.
   Future<void> _handleIncomingPacket(IncomingPacketEvent event) async {
+    debugPrint(
+      'OMNILINK_DART: Chat UI received incoming packet from '
+      '${event.senderPeerId} with ${event.payloadBytes.length} bytes',
+    );
+
     // Only process packets received from this peer
     if (event.senderPeerId != widget.peerId) return;
 

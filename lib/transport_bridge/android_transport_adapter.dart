@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'transport_adapter.dart';
@@ -37,21 +38,41 @@ class AndroidTransportAdapter implements TransportAdapter {
     if (rawEvent is! Map) return;
 
     final map = Map<String, dynamic>.from(rawEvent);
-    final eventType = map['eventType'] as String?;
 
+    // Incoming packet events are identified by type == "incomingPacket".
+    if (map['type'] == 'incomingPacket') {
+      final peerId = map['peerId'] as String? ?? 'unknown_peer';
+      final rawPayload = map['bytes'];
+
+      final Uint8List payloadBytes = _coerceToUint8List(rawPayload);
+
+      debugPrint(
+        'OMNILINK_DART: Received incomingPacket event from $peerId with '
+        '${payloadBytes.length} bytes',
+      );
+
+      _incomingPacketController.add(
+        IncomingPacketEvent(
+          senderPeerId: peerId,
+          payloadBytes: payloadBytes,
+        ),
+      );
+      return;
+    }
+
+    // Legacy/diagnostic shape: eventType == "onPacketReceived".
+    final eventType = map['eventType'] as String?;
     if (eventType == 'onPacketReceived') {
       final senderPeerId =
           (map['senderPeerId'] ?? map['senderId']) as String? ?? 'unknown_peer';
       final rawPayload = map['payloadBytes'];
 
-      Uint8List payloadBytes;
-      if (rawPayload is Uint8List) {
-        payloadBytes = rawPayload;
-      } else if (rawPayload is List) {
-        payloadBytes = Uint8List.fromList(List<int>.from(rawPayload));
-      } else {
-        payloadBytes = Uint8List(0);
-      }
+      final Uint8List payloadBytes = _coerceToUint8List(rawPayload);
+
+      debugPrint(
+        'OMNILINK_DART: Received onPacketReceived event from $senderPeerId '
+        'with ${payloadBytes.length} bytes',
+      );
 
       _incomingPacketController.add(
         IncomingPacketEvent(
@@ -59,17 +80,31 @@ class AndroidTransportAdapter implements TransportAdapter {
           payloadBytes: payloadBytes,
         ),
       );
-    } else {
-      final peerEvent = PeerConnectionEvent.fromMap(map);
-
-      if (peerEvent.eventType == PeerConnectionEventType.onConnected) {
-        _connectedPeers.add(peerEvent.peerId);
-      } else if (peerEvent.eventType == PeerConnectionEventType.onDisconnected) {
-        _connectedPeers.remove(peerEvent.peerId);
-      }
-
-      _peerEventController.add(peerEvent);
+      return;
     }
+
+    final peerEvent = PeerConnectionEvent.fromMap(map);
+
+    if (peerEvent.eventType == PeerConnectionEventType.onConnected) {
+      _connectedPeers.add(peerEvent.peerId);
+    } else if (peerEvent.eventType == PeerConnectionEventType.onDisconnected) {
+      _connectedPeers.remove(peerEvent.peerId);
+    }
+
+    _peerEventController.add(peerEvent);
+  }
+
+  /// Normalizes native byte payloads into [Uint8List]. Native side sends a
+  /// ByteArray which arrives here as a [Uint8List]; defensively also accepts
+  /// a generic [List] of ints.
+  Uint8List _coerceToUint8List(dynamic rawPayload) {
+    if (rawPayload is Uint8List) {
+      return rawPayload;
+    }
+    if (rawPayload is List) {
+      return Uint8List.fromList(List<int>.from(rawPayload));
+    }
+    return Uint8List(0);
   }
 
   void _handleNativeError(dynamic error) {
@@ -170,6 +205,9 @@ class AndroidTransportAdapter implements TransportAdapter {
 
   @override
   Future<bool> sendPacket(String peerId, Uint8List packetBytes) async {
+    debugPrint(
+      'OMNILINK_DART: sendPacket called to $peerId with ${packetBytes.length} bytes',
+    );
     try {
       final result = await _controlChannel.invokeMethod<bool>(
         'sendPacket',

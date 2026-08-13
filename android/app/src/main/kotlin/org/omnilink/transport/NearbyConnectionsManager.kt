@@ -3,6 +3,7 @@ package org.omnilink.transport
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
@@ -25,6 +26,8 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     private var isDiscovering = false
 
     companion object {
+        private const val TAG = "OMNILINK_NEARBY"
+
         @Volatile
         private var INSTANCE: NearbyConnectionsManager? = null
 
@@ -41,6 +44,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     fun startAdvertising(): Boolean {
         if (!checkPermissions()) {
+            Log.e(TAG, "startAdvertising rejected: permissions missing")
             OmnilinkTransportPlugin.sendError(
                 "MISSING_PERMISSIONS",
                 "Bluetooth, Nearby Devices, or Location permissions missing."
@@ -51,6 +55,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
         if (isAdvertising) return true
 
         val options = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        Log.d(TAG, "startAdvertising: name=$localDeviceName serviceId=$SERVICE_ID strategy=P2P_CLUSTER")
 
         connectionsClient.startAdvertising(
             localDeviceName,
@@ -59,8 +64,10 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             options
         ).addOnSuccessListener {
             isAdvertising = true
+            Log.d(TAG, "startAdvertising: SUCCESS")
         }.addOnFailureListener { e ->
             isAdvertising = false
+            Log.e(TAG, "startAdvertising: FAILED - ${e.localizedMessage}", e)
             OmnilinkTransportPlugin.sendError(
                 "ADVERTISING_FAILED",
                 e.localizedMessage ?: "Failed to start advertising"
@@ -72,6 +79,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     fun startDiscovery(serviceId: String = SERVICE_ID): Boolean {
         if (!checkPermissions()) {
+            Log.e(TAG, "startDiscovery rejected: permissions missing")
             OmnilinkTransportPlugin.sendError(
                 "MISSING_PERMISSIONS",
                 "Bluetooth, Nearby Devices, or Location permissions missing."
@@ -85,6 +93,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
         if (isDiscovering) return true
 
         val options = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        Log.d(TAG, "startDiscovery: serviceId=$serviceId strategy=P2P_CLUSTER")
 
         connectionsClient.startDiscovery(
             serviceId,
@@ -92,8 +101,10 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             options
         ).addOnSuccessListener {
             isDiscovering = true
+            Log.d(TAG, "startDiscovery: SUCCESS")
         }.addOnFailureListener { e ->
             isDiscovering = false
+            Log.e(TAG, "startDiscovery: FAILED - ${e.localizedMessage}", e)
             OmnilinkTransportPlugin.sendError(
                 "DISCOVERY_FAILED",
                 e.localizedMessage ?: "Failed to start discovery"
@@ -107,10 +118,12 @@ class NearbyConnectionsManager private constructor(private val context: Context)
         if (isDiscovering) {
             connectionsClient.stopDiscovery()
             isDiscovering = false
+            Log.d(TAG, "stopDiscovery: stopped")
         }
         if (isAdvertising) {
             connectionsClient.stopAdvertising()
             isAdvertising = false
+            Log.d(TAG, "stopAdvertising: stopped")
         }
         return true
     }
@@ -121,15 +134,18 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     fun connectPeer(peerId: String): Boolean {
         if (!checkPermissions()) {
+            Log.e(TAG, "connectPeer rejected: permissions missing")
             OmnilinkTransportPlugin.sendError("MISSING_PERMISSIONS", "Permissions missing for connect")
             return false
         }
 
+        Log.d(TAG, "connectPeer: requesting connection to $peerId")
         connectionsClient.requestConnection(
             localDeviceName,
             peerId,
             connectionLifecycleCallback
         ).addOnFailureListener { e ->
+            Log.e(TAG, "connectPeer: FAILED - ${e.localizedMessage}", e)
             OmnilinkTransportPlugin.sendError(
                 "CONNECTION_REQUEST_FAILED",
                 e.localizedMessage ?: "Failed to request connection to $peerId"
@@ -142,6 +158,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     fun disconnectPeer(peerId: String): Boolean {
         connectionsClient.disconnectFromEndpoint(peerId)
         connectedPeers.remove(peerId)
+        Log.d(TAG, "disconnectPeer: $peerId")
 
         OmnilinkTransportPlugin.sendEvent(
             mapOf(
@@ -163,6 +180,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     fun sendPacket(peerId: String, payloadBytes: ByteArray): Boolean {
         if (payloadBytes.size > 4096) {
+            Log.e(TAG, "OMNILINK_NEARBY: sendPacket REJECTED to $peerId - payload too large (${payloadBytes.size} bytes)")
             OmnilinkTransportPlugin.sendError(
                 "INVALID_PACKET_SIZE",
                 "Payload size (${payloadBytes.size} bytes) exceeds 4,096 byte MTU limit"
@@ -171,6 +189,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
         }
 
         if (!connectedPeers.contains(peerId)) {
+            Log.e(TAG, "OMNILINK_NEARBY: sendPacket REJECTED to $peerId - not in connectedPeers=$connectedPeers")
             OmnilinkTransportPlugin.sendError(
                 "PEER_NOT_CONNECTED",
                 "Cannot send packet: Endpoint $peerId is not connected."
@@ -178,12 +197,27 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             return false
         }
 
-        val payload = Payload.fromBytes(payloadBytes)
-        connectionsClient.sendPayload(peerId, payload).addOnFailureListener { e ->
+        Log.d(TAG, "OMNILINK_NEARBY: sendPayload called to $peerId with ${payloadBytes.size} bytes")
+        try {
+            val payload = Payload.fromBytes(payloadBytes)
+            connectionsClient.sendPayload(peerId, payload)
+                .addOnSuccessListener {
+                    Log.d(TAG, "OMNILINK_NEARBY: sendPayload task SUCCESS to $peerId")
+                }
+                .addOnFailureListener { e ->
+                    Log.e(TAG, "OMNILINK_NEARBY: sendPayload task FAILED to $peerId - ${e.localizedMessage}", e)
+                    OmnilinkTransportPlugin.sendError(
+                        "PAYLOAD_SEND_FAILED",
+                        e.localizedMessage ?: "Failed to transmit payload to $peerId"
+                    )
+                }
+        } catch (e: Exception) {
+            Log.e(TAG, "OMNILINK_NEARBY: sendPayload THREW for $peerId - ${e.message}", e)
             OmnilinkTransportPlugin.sendError(
                 "PAYLOAD_SEND_FAILED",
-                e.localizedMessage ?: "Failed to transmit payload to $peerId"
+                "sendPayload threw: ${e.message}"
             )
+            return false
         }
 
         return true
@@ -195,6 +229,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
+            Log.d(TAG, "onEndpointFound: id=$endpointId name=${info.endpointName} serviceId=${info.serviceId}")
             OmnilinkTransportPlugin.sendEvent(
                 mapOf(
                     "eventType" to "onPeerFound",
@@ -207,6 +242,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
         }
 
         override fun onEndpointLost(endpointId: String) {
+            Log.d(TAG, "onEndpointLost: id=$endpointId")
             OmnilinkTransportPlugin.sendEvent(
                 mapOf(
                     "eventType" to "onPeerLost",
@@ -218,14 +254,20 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            // Automatically accept incoming connections for direct P2P link
+            Log.d(TAG, "onConnectionInitiated: id=$endpointId token=${info.authenticationToken} endpoint=${info.endpointName} incoming=${info.isIncomingConnection}")
+            // Automatically accept incoming connections for direct P2P link.
+            // Per the Nearby Connections docs, onConnectionInitiated fires on BOTH sides
+            // and BOTH sides must call acceptConnection so each registers its own
+            // receive-side PayloadCallback.
             connectionsClient.acceptConnection(endpointId, payloadCallback)
+            Log.d(TAG, "OMNILINK_NEARBY: acceptConnection called for $endpointId")
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             when (result.status.statusCode) {
                 ConnectionsStatusCodes.STATUS_OK -> {
                     connectedPeers.add(endpointId)
+                    Log.d(TAG, "onConnectionResult: $endpointId STATUS_OK -> connected")
                     OmnilinkTransportPlugin.sendEvent(
                         mapOf(
                             "eventType" to "onConnected",
@@ -236,6 +278,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
                 }
                 else -> {
                     connectedPeers.remove(endpointId)
+                    Log.e(TAG, "onConnectionResult: $endpointId FAILED statusCode=${result.status.statusCode}")
                     OmnilinkTransportPlugin.sendError(
                         "CONNECTION_FAILED",
                         "Connection to $endpointId failed with status code ${result.status.statusCode}"
@@ -246,6 +289,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
         override fun onDisconnected(endpointId: String) {
             connectedPeers.remove(endpointId)
+            Log.d(TAG, "onDisconnected: $endpointId")
             OmnilinkTransportPlugin.sendEvent(
                 mapOf(
                     "eventType" to "onDisconnected",
@@ -260,20 +304,40 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             if (payload.type == Payload.Type.BYTES) {
                 val bytes = payload.asBytes()
                 if (bytes != null) {
-                    // Emit raw payload bytes directly to Dart EventSink without base64/json string parsing
+                    Log.d(TAG, "OMNILINK_NEARBY: onPayloadReceived from $endpointId with ${bytes.size} bytes")
+                    // Emit raw payload bytes directly to Dart EventSink.
+                    // Event map format MUST be: type / incomingPacket / peerId / bytes.
                     OmnilinkTransportPlugin.sendEvent(
                         mapOf(
-                            "eventType" to "onPacketReceived",
-                            "senderPeerId" to endpointId,
-                            "payloadBytes" to bytes
+                            "type" to "incomingPacket",
+                            "peerId" to endpointId,
+                            "bytes" to bytes
                         )
                     )
+                } else {
+                    Log.e(TAG, "OMNILINK_NEARBY: onPayloadReceived from $endpointId but payload.asBytes() returned null")
                 }
+            } else {
+                Log.d(TAG, "OMNILINK_NEARBY: onPayloadReceived from $endpointId with non-BYTES type=${payload.type}")
             }
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            // Unused for short MTU payloads (<= 4 KB)
+            Log.d(TAG, "OMNILINK_NEARBY: onPayloadTransferUpdate for $endpointId status=${update.status} bytes=${update.bytesTransferred}/${update.totalBytes}")
+            when (update.status) {
+                PayloadTransferUpdate.Status.SUCCESS -> {
+                    Log.d(TAG, "OMNILINK_NEARBY: payload transfer SUCCESS for $endpointId")
+                }
+                PayloadTransferUpdate.Status.IN_PROGRESS -> {
+                    // Intermediate progress; no action needed for small BYTES payloads.
+                }
+                PayloadTransferUpdate.Status.FAILURE -> {
+                    Log.e(TAG, "OMNILINK_NEARBY: payload transfer FAILURE for $endpointId bytes=${update.bytesTransferred}/${update.totalBytes}")
+                }
+                else -> {
+                    Log.e(TAG, "OMNILINK_NEARBY: payload transfer UNKNOWN status=${update.status} for $endpointId")
+                }
+            }
         }
     }
 
@@ -289,11 +353,17 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             if (scan != PackageManager.PERMISSION_GRANTED ||
                 connect != PackageManager.PERMISSION_GRANTED ||
                 advertise != PackageManager.PERMISSION_GRANTED) {
+                Log.e(TAG, "checkPermissions: S+ missing scan=$scan connect=$connect advertise=$advertise")
                 return false
             }
         }
 
         val location = ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION)
-        return location == PackageManager.PERMISSION_GRANTED
+        if (location != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "checkPermissions: missing fine location (granted=$location)")
+            return false
+        }
+        Log.d(TAG, "checkPermissions: ALL GRANTED")
+        return true
     }
 }
