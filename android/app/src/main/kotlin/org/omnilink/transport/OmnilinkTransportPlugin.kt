@@ -139,6 +139,10 @@ class OmnilinkTransportPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
             "getAndroidPermissionDetails" -> {
                 result.success(getAndroidPermissionDetails())
             }
+            "getTransportCapability" -> {
+                val capability = manager.getTransportCapabilityMap()
+                result.success(capability)
+            }
             "startForegroundService" -> {
                 val ctx = context
                 if (ctx != null) {

@@ -230,6 +230,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
         // Store encrypted envelope in persistent SQLite Outbox
         await outboxRepo.saveToOutbox(envelope);
+        debugPrint('OMNILINK_TRANSPORT: message queued because no active route');
 
         // Trigger background Anti-Entropy Summary Vector Exchange across active radio links
         await daemon.triggerAntiEntropySync();

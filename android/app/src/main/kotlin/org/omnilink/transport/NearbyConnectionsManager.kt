@@ -55,54 +55,87 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     // RADIO PREFLIGHT CHECKS (Fix #2)
     // --------------------------------------------------------------------------
 
-    fun performPreflightChecks(): Boolean {
+    fun performPreflightChecks(isDiscoveryAttempt: Boolean = false): Boolean {
         val t0 = System.currentTimeMillis()
-        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] performing radio preflight checks...")
+        val sdkInt = Build.VERSION.SDK_INT
+        Log.d(TAG, "OMNILINK_TRANSPORT: [t=$t0] performing radio preflight checks (sdk=$sdkInt)...")
 
-        // 1. Bluetooth enabled check
+        // 1. Bluetooth enabled check (REQUIRED)
         val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
         val bluetoothEnabled = bluetoothAdapter != null && bluetoothAdapter.isEnabled
-        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Bluetooth enabled=$bluetoothEnabled")
+        Log.d(TAG, "OMNILINK_TRANSPORT: [t=$t0] Bluetooth enabled=$bluetoothEnabled")
         if (!bluetoothEnabled) {
             OmnilinkTransportPlugin.sendError(
-                "BLUETOOTH_DISABLED",
-                "Bluetooth must be enabled for device discovery and connection"
+                "BLUETOOTH_REQUIRED",
+                "Bluetooth is required for peer discovery and messaging."
             )
+            return false
         }
 
-        // 2. Wi-Fi enabled check
+        // 2. Wi-Fi enabled check (OPTIONAL - SPEED BOOSTER)
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         val wifiEnabled = wifiManager?.isWifiEnabled == true
-        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Wi-Fi enabled=$wifiEnabled")
+        Log.d(TAG, "OMNILINK_TRANSPORT: [t=$t0] Wi-Fi enabled=$wifiEnabled")
         if (!wifiEnabled) {
+            Log.i(TAG, "OMNILINK_TRANSPORT: Wi-Fi is off. Operating in Bluetooth-only transport mode.")
             OmnilinkTransportPlugin.sendError(
-                "WIFI_DISABLED",
-                "Wi-Fi must be enabled for fast offline messaging"
+                "WIFI_RECOMMENDED",
+                "Wi-Fi improves speed but is not required for text messages."
             )
         }
 
-        // 3. Location enabled check
+        // 3. Location enabled check (CONDITIONAL: Android 11 or lower only)
         val locationManager = context.applicationContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
         val locationEnabled = locationManager?.isProviderEnabled(LocationManager.GPS_PROVIDER) == true ||
                 locationManager?.isProviderEnabled(LocationManager.NETWORK_PROVIDER) == true
-        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Location enabled=$locationEnabled")
-        if (!locationEnabled) {
+        Log.d(TAG, "OMNILINK_TRANSPORT: [t=$t0] Location enabled=$locationEnabled")
+
+        val locationRequired = sdkInt <= 31 && isDiscoveryAttempt
+        if (locationRequired && !locationEnabled) {
             OmnilinkTransportPlugin.sendError(
-                "LOCATION_DISABLED",
-                "Location must be enabled for device discovery"
+                "LOCATION_REQUIRED",
+                "Android 11 or lower requires Location to discover new nearby devices."
             )
+            return false
         }
 
-        // 4. Google Play Services check
+        // 4. Permissions check
+        val permissionsGranted = checkPermissions()
+
+        val selectedMode = if (bluetoothEnabled && wifiEnabled) "highSpeedMesh" else if (bluetoothEnabled) "bluetoothOnly" else "offlineQueue"
+        Log.i(TAG, "OMNILINK_TRANSPORT: capability bluetooth=$bluetoothEnabled wifi=$wifiEnabled location=$locationEnabled sdk=$sdkInt")
+        Log.i(TAG, "OMNILINK_TRANSPORT: selected mode=$selectedMode")
+
+        return bluetoothEnabled && permissionsGranted
+    }
+
+    fun getTransportCapabilityMap(): Map<String, Any> {
+        val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+        val bluetoothEnabled = bluetoothAdapter != null && bluetoothAdapter.isEnabled
+
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val wifiEnabled = wifiManager?.isWifiEnabled == true
+
+        val locationManager = context.applicationContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        val locationEnabled = locationManager?.isProviderEnabled(LocationManager.GPS_PROVIDER) == true ||
+                locationManager?.isProviderEnabled(LocationManager.NETWORK_PROVIDER) == true
+
+        val sdkInt = Build.VERSION.SDK_INT
         val playServicesCode = GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(context)
         val playServicesAvailable = playServicesCode == ConnectionResult.SUCCESS
-        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Play Services available=$playServicesAvailable (code=$playServicesCode)")
 
-        // 5. Permissions check
-        val permissionsGranted = checkPermissions()
-        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Permissions granted=$permissionsGranted")
+        val canDiscover = bluetoothEnabled && checkPermissions() && (sdkInt > 31 || locationEnabled)
 
-        return bluetoothEnabled && wifiEnabled && locationEnabled && permissionsGranted
+        return mapOf(
+            "bluetoothEnabled" to bluetoothEnabled,
+            "wifiEnabled" to wifiEnabled,
+            "locationEnabled" to locationEnabled,
+            "androidSdkInt" to sdkInt,
+            "nearbyPlayServicesAvailable" to playServicesAvailable,
+            "canDiscoverNewPeers" to canDiscover,
+            "canUseHighBandwidth" to wifiEnabled,
+            "canUseBluetoothOnlyFallback" to bluetoothEnabled
+        )
     }
 
     // --------------------------------------------------------------------------
@@ -111,7 +144,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     fun startAdvertising(): Boolean {
         val t0 = System.currentTimeMillis()
-        if (!performPreflightChecks()) {
+        if (!performPreflightChecks(isDiscoveryAttempt = true)) {
             Log.e(TAG, "OMNILINK_NEARBY: [t=$t0] startAdvertising rejected: preflight checks failed")
             return false
         }
@@ -145,7 +178,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     fun startDiscovery(serviceId: String = SERVICE_ID): Boolean {
         val t0 = System.currentTimeMillis()
-        if (!performPreflightChecks()) {
+        if (!performPreflightChecks(isDiscoveryAttempt = true)) {
             Log.e(TAG, "OMNILINK_NEARBY: [t=$t0] startDiscovery rejected: preflight checks failed")
             return false
         }

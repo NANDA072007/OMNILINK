@@ -217,63 +217,78 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     }
   }
 
-  /// Fix #3: User-Visible Transport Warning Banner
+  /// Task #3: User-Visible Transport Status Card with Graceful Degradation
   Widget _buildRadioWarningBanner() {
     final diag = _diag;
     if (diag == null) return const SizedBox.shrink();
 
-    final List<String> warnings = [];
-    if (diag.bluetoothEnabled == false) warnings.add('Bluetooth is OFF');
-    if (diag.wifiEnabled == false) warnings.add('Wi-Fi is OFF');
-    if (diag.locationEnabled == false) warnings.add('Location is OFF');
+    final btOff = diag.bluetoothEnabled == false;
+    final wifiOff = diag.wifiEnabled == false;
+    final locOff = diag.locationEnabled == false;
+    final isAndroid11OrBelow = diag.sdkInt <= 31;
 
-    final missingPerms = diag.permissionGranted.entries
-        .where((e) => !e.value)
-        .map((e) => e.key.replaceAll('Granted', ''))
-        .toList();
-    if (missingPerms.isNotEmpty) {
-      warnings.add('Missing Perms: ${missingPerms.join(', ')}');
-    }
+    // Bluetooth is REQUIRED. Wi-Fi is OPTIONAL. Location is CONDITIONAL on Android <= 11.
+    final bool hasIssue = btOff || wifiOff || (isAndroid11OrBelow && locOff);
+    if (!hasIssue) return const SizedBox.shrink();
 
-    if (warnings.isEmpty) return const SizedBox.shrink();
+    final cardColor = btOff
+        ? const Color(0xFFD32F2F) // Red if Bluetooth (REQUIRED) is OFF
+        : Colors.amber.shade900; // Yellow if Wi-Fi / Location (OPTIONAL) is OFF
 
     return Container(
-      color: const Color(0xFFD32F2F),
+      color: cardColor,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 24),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'TRANSPORT RADIO WARNING',
-                  style: TextStyle(
+          Row(
+            children: [
+              Icon(
+                btOff ? Icons.bluetooth_disabled_rounded : Icons.info_outline_rounded,
+                color: Colors.white,
+                size: 22,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  btOff
+                      ? 'BLUETOOTH REQUIRED'
+                      : (wifiOff ? 'WI-FI SPEED BOOSTER OFF' : 'LOCATION CONDITIONAL NOTICE'),
+                  style: const TextStyle(
                     fontWeight: FontWeight.bold,
                     color: Colors.white,
                     fontSize: 12,
                     letterSpacing: 0.5,
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  warnings.join(' • '),
-                  style: const TextStyle(color: Colors.white70, fontSize: 11),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 ),
-              ],
-            ),
+                onPressed: _openAppSettings,
+                child: const Text('Radios', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+              ),
+            ],
           ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.white,
-              foregroundColor: Colors.red.shade900,
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          const SizedBox(height: 6),
+          if (btOff)
+            const Text(
+              'Bluetooth is required to discover and connect to nearby mesh devices.',
+              style: TextStyle(color: Colors.white, fontSize: 11),
+            )
+          else if (wifiOff)
+            const Text(
+              'Wi-Fi is off. Delivery may be slower. Text messages can still be queued over Bluetooth.',
+              style: TextStyle(color: Colors.white, fontSize: 11),
+            )
+          else if (isAndroid11OrBelow && locOff)
+            const Text(
+              'Android 11 requires Location to discover new nearby devices. You can still connect to paired devices.',
+              style: TextStyle(color: Colors.white, fontSize: 11),
             ),
-            onPressed: _openAppSettings,
-            child: const Text('Fix', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-          ),
         ],
       ),
     );

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import '../core/models/transport_capability.dart';
 import 'transport_adapter.dart';
 
 /// Android Platform Channel implementation of the abstract [TransportAdapter] contract.
@@ -43,6 +44,25 @@ class AndroidTransportAdapter implements TransportAdapter {
     } catch (e) {
       debugPrint('OMNILINK_DART: Exception starting Foreground Service: $e');
       return false;
+    }
+  }
+
+  /// Fetches granular hardware radio and permission capability map.
+  Future<TransportCapability?> getTransportCapability() async {
+    try {
+      final map = await _controlChannel.invokeMapMethod<String, dynamic>(
+        'getTransportCapability',
+      );
+      if (map == null) return null;
+      final cap = TransportCapability.fromMap(map);
+      debugPrint(
+        'OMNILINK_TRANSPORT: capability bluetooth=${cap.bluetoothEnabled} wifi=${cap.wifiEnabled} location=${cap.locationEnabled} sdk=${cap.androidSdkInt}',
+      );
+      debugPrint('OMNILINK_TRANSPORT: selected mode=${cap.selectTransportMode().name}');
+      return cap;
+    } catch (e) {
+      debugPrint('OMNILINK_DART: Error fetching TransportCapability: $e');
+      return null;
     }
   }
 
