@@ -1,19 +1,23 @@
 package org.omnilink.transport
 
+import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
+import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
 
 /**
  * Native Android Transport Manager implementing Google Nearby Connections API.
- * Handles Bluetooth & Wi-Fi Direct physical radio advertising, discovery, socket lifecycle,
- * and raw binary payload transmission using Strategy.P2P_CLUSTER mode.
- *
- * See docs/09_android_native_transport_design.md and spec/transports.md.
+ * Uses Strategy.P2P_STAR for fast, high-bandwidth 1-to-1 direct device link creation.
  */
 class NearbyConnectionsManager private constructor(private val context: Context) {
 
@@ -21,9 +25,18 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     private val SERVICE_ID = "org.omnilink.mesh.v1"
     private val localDeviceName = "OMNILINK_${Build.MODEL.replace(" ", "_")}"
 
+    // Strategy rule #1: Configurable constant set to Strategy.P2P_STAR
+    private val strategy = Strategy.P2P_STAR
+
     private val connectedPeers = mutableSetOf<String>()
+    private val pendingOutgoingConnections = mutableMapOf<String, Long>()
+    private val handler = Handler(Looper.getMainLooper())
+    private val connectionTimeoutRunnables = mutableMapOf<String, Runnable>()
+
     private var isAdvertising = false
     private var isDiscovering = false
+    private var hasRetriedDiscovery = false
+    private var discoveryTimeoutRunnable: Runnable? = null
 
     companion object {
         private const val TAG = "OMNILINK_NEARBY"
@@ -39,23 +52,74 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     }
 
     // --------------------------------------------------------------------------
+    // RADIO PREFLIGHT CHECKS (Fix #2)
+    // --------------------------------------------------------------------------
+
+    fun performPreflightChecks(): Boolean {
+        val t0 = System.currentTimeMillis()
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] performing radio preflight checks...")
+
+        // 1. Bluetooth enabled check
+        val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+        val bluetoothEnabled = bluetoothAdapter != null && bluetoothAdapter.isEnabled
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Bluetooth enabled=$bluetoothEnabled")
+        if (!bluetoothEnabled) {
+            OmnilinkTransportPlugin.sendError(
+                "BLUETOOTH_DISABLED",
+                "Bluetooth must be enabled for device discovery and connection"
+            )
+        }
+
+        // 2. Wi-Fi enabled check
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val wifiEnabled = wifiManager?.isWifiEnabled == true
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Wi-Fi enabled=$wifiEnabled")
+        if (!wifiEnabled) {
+            OmnilinkTransportPlugin.sendError(
+                "WIFI_DISABLED",
+                "Wi-Fi must be enabled for fast offline messaging"
+            )
+        }
+
+        // 3. Location enabled check
+        val locationManager = context.applicationContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        val locationEnabled = locationManager?.isProviderEnabled(LocationManager.GPS_PROVIDER) == true ||
+                locationManager?.isProviderEnabled(LocationManager.NETWORK_PROVIDER) == true
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Location enabled=$locationEnabled")
+        if (!locationEnabled) {
+            OmnilinkTransportPlugin.sendError(
+                "LOCATION_DISABLED",
+                "Location must be enabled for device discovery"
+            )
+        }
+
+        // 4. Google Play Services check
+        val playServicesCode = GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(context)
+        val playServicesAvailable = playServicesCode == ConnectionResult.SUCCESS
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Play Services available=$playServicesAvailable (code=$playServicesCode)")
+
+        // 5. Permissions check
+        val permissionsGranted = checkPermissions()
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] Permissions granted=$permissionsGranted")
+
+        return bluetoothEnabled && wifiEnabled && locationEnabled && permissionsGranted
+    }
+
+    // --------------------------------------------------------------------------
     // ADVERTISING & DISCOVERY LIFECYCLE
     // --------------------------------------------------------------------------
 
     fun startAdvertising(): Boolean {
-        if (!checkPermissions()) {
-            Log.e(TAG, "startAdvertising rejected: permissions missing")
-            OmnilinkTransportPlugin.sendError(
-                "MISSING_PERMISSIONS",
-                "Bluetooth, Nearby Devices, or Location permissions missing."
-            )
+        val t0 = System.currentTimeMillis()
+        if (!performPreflightChecks()) {
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$t0] startAdvertising rejected: preflight checks failed")
             return false
         }
 
         if (isAdvertising) return true
 
-        val options = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        Log.d(TAG, "startAdvertising: name=$localDeviceName serviceId=$SERVICE_ID strategy=P2P_CLUSTER")
+        val options = AdvertisingOptions.Builder().setStrategy(strategy).build()
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] startAdvertising name=$localDeviceName serviceId=$SERVICE_ID strategy=P2P_STAR")
 
         connectionsClient.startAdvertising(
             localDeviceName,
@@ -63,11 +127,13 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             connectionLifecycleCallback,
             options
         ).addOnSuccessListener {
+            val tSucc = System.currentTimeMillis()
             isAdvertising = true
-            Log.d(TAG, "startAdvertising: SUCCESS")
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tSucc] startAdvertising SUCCESS")
         }.addOnFailureListener { e ->
+            val tFail = System.currentTimeMillis()
             isAdvertising = false
-            Log.e(TAG, "startAdvertising: FAILED - ${e.localizedMessage}", e)
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$tFail] startAdvertising FAILED - ${e.localizedMessage}", e)
             OmnilinkTransportPlugin.sendError(
                 "ADVERTISING_FAILED",
                 e.localizedMessage ?: "Failed to start advertising"
@@ -78,33 +144,33 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     }
 
     fun startDiscovery(serviceId: String = SERVICE_ID): Boolean {
-        if (!checkPermissions()) {
-            Log.e(TAG, "startDiscovery rejected: permissions missing")
-            OmnilinkTransportPlugin.sendError(
-                "MISSING_PERMISSIONS",
-                "Bluetooth, Nearby Devices, or Location permissions missing."
-            )
+        val t0 = System.currentTimeMillis()
+        if (!performPreflightChecks()) {
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$t0] startDiscovery rejected: preflight checks failed")
             return false
         }
 
-        // Also start advertising to enable bi-directional P2P mesh discovery
+        // Start advertising simultaneously to enable bi-directional P2P star discovery
         startAdvertising()
 
         if (isDiscovering) return true
 
-        val options = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        Log.d(TAG, "startDiscovery: serviceId=$serviceId strategy=P2P_CLUSTER")
+        val options = DiscoveryOptions.Builder().setStrategy(strategy).build()
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] startDiscovery serviceId=$serviceId strategy=P2P_STAR")
 
         connectionsClient.startDiscovery(
             serviceId,
             endpointDiscoveryCallback,
             options
         ).addOnSuccessListener {
+            val tSucc = System.currentTimeMillis()
             isDiscovering = true
-            Log.d(TAG, "startDiscovery: SUCCESS")
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tSucc] startDiscovery SUCCESS")
+            scheduleDiscoveryTimeout(serviceId)
         }.addOnFailureListener { e ->
+            val tFail = System.currentTimeMillis()
             isDiscovering = false
-            Log.e(TAG, "startDiscovery: FAILED - ${e.localizedMessage}", e)
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$tFail] startDiscovery FAILED - ${e.localizedMessage}", e)
             OmnilinkTransportPlugin.sendError(
                 "DISCOVERY_FAILED",
                 e.localizedMessage ?: "Failed to start discovery"
@@ -114,38 +180,98 @@ class NearbyConnectionsManager private constructor(private val context: Context)
         return true
     }
 
+    // Discovery Timeout & Single Retry (Fix #5: 20 seconds)
+    private fun scheduleDiscoveryTimeout(serviceId: String) {
+        discoveryTimeoutRunnable?.let { handler.removeCallbacks(it) }
+
+        val runnable = Runnable {
+            val tNow = System.currentTimeMillis()
+            if (isDiscovering && connectedPeers.isEmpty()) {
+                Log.w(TAG, "OMNILINK_NEARBY: [t=$tNow] no peers found in 20s")
+                if (!hasRetriedDiscovery) {
+                    hasRetriedDiscovery = true
+                    Log.d(TAG, "OMNILINK_NEARBY: [t=$tNow] restarting discovery once after 1s delay...")
+                    connectionsClient.stopDiscovery()
+                    isDiscovering = false
+                    handler.postDelayed({
+                        startDiscovery(serviceId)
+                    }, 1000L)
+                }
+            }
+        }
+        discoveryTimeoutRunnable = runnable
+        handler.postDelayed(runnable, 20000L)
+    }
+
     fun stopDiscovery(): Boolean {
+        val t0 = System.currentTimeMillis()
+        discoveryTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        hasRetriedDiscovery = false
+
         if (isDiscovering) {
             connectionsClient.stopDiscovery()
             isDiscovering = false
-            Log.d(TAG, "stopDiscovery: stopped")
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] stopDiscovery stopped")
         }
         if (isAdvertising) {
             connectionsClient.stopAdvertising()
             isAdvertising = false
-            Log.d(TAG, "stopAdvertising: stopped")
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] stopAdvertising stopped")
         }
         return true
     }
 
     // --------------------------------------------------------------------------
-    // CONNECTION LIFECYCLE & PEER MANAGEMENT
+    // CONNECTION LIFECYCLE & PEER MANAGEMENT (Fix #4 & #10)
     // --------------------------------------------------------------------------
 
     fun connectPeer(peerId: String): Boolean {
+        val t0 = System.currentTimeMillis()
         if (!checkPermissions()) {
-            Log.e(TAG, "connectPeer rejected: permissions missing")
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$t0] connectPeer rejected: permissions missing")
             OmnilinkTransportPlugin.sendError("MISSING_PERMISSIONS", "Permissions missing for connect")
             return false
         }
 
-        Log.d(TAG, "connectPeer: requesting connection to $peerId")
+        // Prevent Duplicate Connection Races (Fix #10: Ignore duplicate requests for 5s)
+        val lastAttempt = pendingOutgoingConnections[peerId]
+        if (lastAttempt != null && (t0 - lastAttempt) < 5000L) {
+            Log.w(TAG, "OMNILINK_NEARBY: [t=$t0] ignoring duplicate connection attempt for peerId=$peerId (lock active)")
+            return false
+        }
+        pendingOutgoingConnections[peerId] = t0
+
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] connectPeer requested for peerId=$peerId")
+
+        // Connection Timeout (Fix #4: 15 seconds)
+        val timeoutRunnable = Runnable {
+            val tTimeout = System.currentTimeMillis()
+            if (!connectedPeers.contains(peerId)) {
+                Log.e(TAG, "OMNILINK_NEARBY: [t=$tTimeout] connection timeout for peerId=$peerId")
+                pendingOutgoingConnections.remove(peerId)
+                OmnilinkTransportPlugin.sendEvent(
+                    mapOf(
+                        "eventType" to "onError",
+                        "peerId" to peerId,
+                        "errorCode" to "CONNECTION_TIMEOUT",
+                        "errorMessage" to "Connection to $peerId timed out after 15 seconds"
+                    )
+                )
+            }
+        }
+        connectionTimeoutRunnables[peerId]?.let { handler.removeCallbacks(it) }
+        connectionTimeoutRunnables[peerId] = timeoutRunnable
+        handler.postDelayed(timeoutRunnable, 15000L)
+
         connectionsClient.requestConnection(
             localDeviceName,
             peerId,
             connectionLifecycleCallback
         ).addOnFailureListener { e ->
-            Log.e(TAG, "connectPeer: FAILED - ${e.localizedMessage}", e)
+            val tFail = System.currentTimeMillis()
+            connectionTimeoutRunnables.remove(peerId)?.let { handler.removeCallbacks(it) }
+            pendingOutgoingConnections.remove(peerId)
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$tFail] connectPeer FAILED - ${e.localizedMessage}", e)
             OmnilinkTransportPlugin.sendError(
                 "CONNECTION_REQUEST_FAILED",
                 e.localizedMessage ?: "Failed to request connection to $peerId"
@@ -156,9 +282,12 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     }
 
     fun disconnectPeer(peerId: String): Boolean {
+        val t0 = System.currentTimeMillis()
         connectionsClient.disconnectFromEndpoint(peerId)
         connectedPeers.remove(peerId)
-        Log.d(TAG, "disconnectPeer: $peerId")
+        pendingOutgoingConnections.remove(peerId)
+        connectionTimeoutRunnables.remove(peerId)?.let { handler.removeCallbacks(it) }
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] disconnectPeer $peerId")
 
         OmnilinkTransportPlugin.sendEvent(
             mapOf(
@@ -175,12 +304,15 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     }
 
     // --------------------------------------------------------------------------
-    // RAW PAYLOAD TRANSMISSION & RECEPTION
+    // RAW PAYLOAD TRANSMISSION & RECEPTION (Fix #12 & #13)
     // --------------------------------------------------------------------------
 
     fun sendPacket(peerId: String, payloadBytes: ByteArray): Boolean {
+        val t0 = System.currentTimeMillis()
+        Log.d(TAG, "OMNILINK_NEARBY: [t=$t0] sendPacket called for peerId=$peerId byteSize=${payloadBytes.size}")
+
         if (payloadBytes.size > 4096) {
-            Log.e(TAG, "OMNILINK_NEARBY: sendPacket REJECTED to $peerId - payload too large (${payloadBytes.size} bytes)")
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$t0] sendPacket REJECTED to $peerId - payload size (${payloadBytes.size} bytes) exceeds 4096 MTU")
             OmnilinkTransportPlugin.sendError(
                 "INVALID_PACKET_SIZE",
                 "Payload size (${payloadBytes.size} bytes) exceeds 4,096 byte MTU limit"
@@ -188,8 +320,9 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             return false
         }
 
+        // Verify connectedPeers contains that peerId (Fix #12)
         if (!connectedPeers.contains(peerId)) {
-            Log.e(TAG, "OMNILINK_NEARBY: sendPacket REJECTED to $peerId - not in connectedPeers=$connectedPeers")
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$t0] sendPacket REJECTED to $peerId - not in connectedPeers=$connectedPeers")
             OmnilinkTransportPlugin.sendError(
                 "PEER_NOT_CONNECTED",
                 "Cannot send packet: Endpoint $peerId is not connected."
@@ -197,22 +330,24 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             return false
         }
 
-        Log.d(TAG, "OMNILINK_NEARBY: sendPayload called to $peerId with ${payloadBytes.size} bytes")
         try {
             val payload = Payload.fromBytes(payloadBytes)
             connectionsClient.sendPayload(peerId, payload)
                 .addOnSuccessListener {
-                    Log.d(TAG, "OMNILINK_NEARBY: sendPayload task SUCCESS to $peerId")
+                    val tSucc = System.currentTimeMillis()
+                    Log.d(TAG, "OMNILINK_NEARBY: [t=$tSucc] sendPayload task SUCCESS for peerId=$peerId")
                 }
                 .addOnFailureListener { e ->
-                    Log.e(TAG, "OMNILINK_NEARBY: sendPayload task FAILED to $peerId - ${e.localizedMessage}", e)
+                    val tFail = System.currentTimeMillis()
+                    Log.e(TAG, "OMNILINK_NEARBY: [t=$tFail] sendPayload task FAILED for peerId=$peerId - ${e.localizedMessage}", e)
                     OmnilinkTransportPlugin.sendError(
                         "PAYLOAD_SEND_FAILED",
                         e.localizedMessage ?: "Failed to transmit payload to $peerId"
                     )
                 }
         } catch (e: Exception) {
-            Log.e(TAG, "OMNILINK_NEARBY: sendPayload THREW for $peerId - ${e.message}", e)
+            val tErr = System.currentTimeMillis()
+            Log.e(TAG, "OMNILINK_NEARBY: [t=$tErr] sendPayload THREW for $peerId - ${e.message}", e)
             OmnilinkTransportPlugin.sendError(
                 "PAYLOAD_SEND_FAILED",
                 "sendPayload threw: ${e.message}"
@@ -224,25 +359,27 @@ class NearbyConnectionsManager private constructor(private val context: Context)
     }
 
     // --------------------------------------------------------------------------
-    // NEARBY CONNECTIONS CALLBACKS
+    // NEARBY CONNECTIONS CALLBACKS WITH LATENCY LOGS
     // --------------------------------------------------------------------------
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-            Log.d(TAG, "onEndpointFound: id=$endpointId name=${info.endpointName} serviceId=${info.serviceId}")
+            val tFound = System.currentTimeMillis()
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tFound] onEndpointFound id=$endpointId name=${info.endpointName} serviceId=${info.serviceId}")
             OmnilinkTransportPlugin.sendEvent(
                 mapOf(
                     "eventType" to "onPeerFound",
                     "peerId" to endpointId,
                     "friendlyName" to info.endpointName,
-                    "rssi" to -50, // Nearby API abstracts RSSI
+                    "rssi" to -50,
                     "transportType" to "ANDROID_NEARBY"
                 )
             )
         }
 
         override fun onEndpointLost(endpointId: String) {
-            Log.d(TAG, "onEndpointLost: id=$endpointId")
+            val tLost = System.currentTimeMillis()
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tLost] onEndpointLost id=$endpointId")
             OmnilinkTransportPlugin.sendEvent(
                 mapOf(
                     "eventType" to "onPeerLost",
@@ -254,20 +391,24 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            Log.d(TAG, "onConnectionInitiated: id=$endpointId token=${info.authenticationToken} endpoint=${info.endpointName} incoming=${info.isIncomingConnection}")
-            // Automatically accept incoming connections for direct P2P link.
-            // Per the Nearby Connections docs, onConnectionInitiated fires on BOTH sides
-            // and BOTH sides must call acceptConnection so each registers its own
-            // receive-side PayloadCallback.
+            val tInit = System.currentTimeMillis()
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tInit] onConnectionInitiated id=$endpointId token=${info.authenticationToken} endpoint=${info.endpointName} incoming=${info.isIncomingConnection}")
+            
+            // Auto-accept incoming connections
             connectionsClient.acceptConnection(endpointId, payloadCallback)
-            Log.d(TAG, "OMNILINK_NEARBY: acceptConnection called for $endpointId")
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tInit] acceptConnection called for $endpointId")
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
+            val tRes = System.currentTimeMillis()
+            // Cancel connection timeout runnable
+            connectionTimeoutRunnables.remove(endpointId)?.let { handler.removeCallbacks(it) }
+            pendingOutgoingConnections.remove(endpointId)
+
             when (result.status.statusCode) {
                 ConnectionsStatusCodes.STATUS_OK -> {
                     connectedPeers.add(endpointId)
-                    Log.d(TAG, "onConnectionResult: $endpointId STATUS_OK -> connected")
+                    Log.d(TAG, "OMNILINK_NEARBY: [t=$tRes] onConnectionResult $endpointId STATUS_OK -> connected")
                     OmnilinkTransportPlugin.sendEvent(
                         mapOf(
                             "eventType" to "onConnected",
@@ -278,7 +419,7 @@ class NearbyConnectionsManager private constructor(private val context: Context)
                 }
                 else -> {
                     connectedPeers.remove(endpointId)
-                    Log.e(TAG, "onConnectionResult: $endpointId FAILED statusCode=${result.status.statusCode}")
+                    Log.e(TAG, "OMNILINK_NEARBY: [t=$tRes] onConnectionResult $endpointId FAILED statusCode=${result.status.statusCode}")
                     OmnilinkTransportPlugin.sendError(
                         "CONNECTION_FAILED",
                         "Connection to $endpointId failed with status code ${result.status.statusCode}"
@@ -288,8 +429,11 @@ class NearbyConnectionsManager private constructor(private val context: Context)
         }
 
         override fun onDisconnected(endpointId: String) {
+            val tDisc = System.currentTimeMillis()
             connectedPeers.remove(endpointId)
-            Log.d(TAG, "onDisconnected: $endpointId")
+            pendingOutgoingConnections.remove(endpointId)
+            connectionTimeoutRunnables.remove(endpointId)?.let { handler.removeCallbacks(it) }
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tDisc] onDisconnected id=$endpointId")
             OmnilinkTransportPlugin.sendEvent(
                 mapOf(
                     "eventType" to "onDisconnected",
@@ -301,12 +445,12 @@ class NearbyConnectionsManager private constructor(private val context: Context)
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
+            val tRecv = System.currentTimeMillis()
             if (payload.type == Payload.Type.BYTES) {
                 val bytes = payload.asBytes()
                 if (bytes != null) {
-                    Log.d(TAG, "OMNILINK_NEARBY: onPayloadReceived from $endpointId with ${bytes.size} bytes")
-                    // Emit raw payload bytes directly to Dart EventSink.
-                    // Event map format MUST be: type / incomingPacket / peerId / bytes.
+                    Log.d(TAG, "OMNILINK_NEARBY: [t=$tRecv] onPayloadReceived from $endpointId with ${bytes.size} bytes")
+                    // Fix #13: Send to Dart EventChannel with timestamp
                     OmnilinkTransportPlugin.sendEvent(
                         mapOf(
                             "type" to "incomingPacket",
@@ -315,35 +459,32 @@ class NearbyConnectionsManager private constructor(private val context: Context)
                         )
                     )
                 } else {
-                    Log.e(TAG, "OMNILINK_NEARBY: onPayloadReceived from $endpointId but payload.asBytes() returned null")
+                    Log.e(TAG, "OMNILINK_NEARBY: [t=$tRecv] onPayloadReceived from $endpointId but payload.asBytes() returned null")
                 }
             } else {
-                Log.d(TAG, "OMNILINK_NEARBY: onPayloadReceived from $endpointId with non-BYTES type=${payload.type}")
+                Log.d(TAG, "OMNILINK_NEARBY: [t=$tRecv] onPayloadReceived from $endpointId with non-BYTES type=${payload.type}")
             }
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            Log.d(TAG, "OMNILINK_NEARBY: onPayloadTransferUpdate for $endpointId status=${update.status} bytes=${update.bytesTransferred}/${update.totalBytes}")
+            val tUpdate = System.currentTimeMillis()
+            Log.d(TAG, "OMNILINK_NEARBY: [t=$tUpdate] onPayloadTransferUpdate for $endpointId status=${update.status} bytes=${update.bytesTransferred}/${update.totalBytes}")
             when (update.status) {
                 PayloadTransferUpdate.Status.SUCCESS -> {
-                    Log.d(TAG, "OMNILINK_NEARBY: payload transfer SUCCESS for $endpointId")
+                    Log.d(TAG, "OMNILINK_NEARBY: [t=$tUpdate] payload transfer SUCCESS for $endpointId")
                 }
                 PayloadTransferUpdate.Status.IN_PROGRESS -> {
-                    // Intermediate progress; no action needed for small BYTES payloads.
+                    // Transfer in progress
                 }
                 PayloadTransferUpdate.Status.FAILURE -> {
-                    Log.e(TAG, "OMNILINK_NEARBY: payload transfer FAILURE for $endpointId bytes=${update.bytesTransferred}/${update.totalBytes}")
+                    Log.e(TAG, "OMNILINK_NEARBY: [t=$tUpdate] payload transfer FAILURE for $endpointId bytes=${update.bytesTransferred}/${update.totalBytes}")
                 }
                 else -> {
-                    Log.e(TAG, "OMNILINK_NEARBY: payload transfer UNKNOWN status=${update.status} for $endpointId")
+                    Log.e(TAG, "OMNILINK_NEARBY: [t=$tUpdate] payload transfer UNKNOWN status=${update.status} for $endpointId")
                 }
             }
         }
     }
-
-    // --------------------------------------------------------------------------
-    // PERMISSIONS VERIFICATION HELPER
-    // --------------------------------------------------------------------------
 
     private fun checkPermissions(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -363,7 +504,6 @@ class NearbyConnectionsManager private constructor(private val context: Context)
             Log.e(TAG, "checkPermissions: missing fine location (granted=$location)")
             return false
         }
-        Log.d(TAG, "checkPermissions: ALL GRANTED")
         return true
     }
 }

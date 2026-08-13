@@ -46,7 +46,7 @@ class DiscoveryScreen extends ConsumerStatefulWidget {
 
 class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
   bool _isDiscovering = false;
-  bool _permissionDialogObserved = false;
+  bool _keepScreenAwake = true;
   PermDiagnostics? _diag;
   String _lastRequestSummary = 'not requested yet';
 
@@ -61,13 +61,17 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
 
   Future<void> _toggleDiscovery() async {
     final adapter = ref.read(transportAdapterProvider);
+    final t0 = DateTime.now().millisecondsSinceEpoch;
+
     if (_isDiscovering) {
+      debugPrint('OMNILINK_DART: [t=$t0] stopDiscovery requested');
       final ok = await adapter.stopDiscovery();
-      debugPrint('OMNILINK_PERM: stopDiscovery -> $ok');
+      debugPrint('OMNILINK_DART: [t=${DateTime.now().millisecondsSinceEpoch}] stopDiscovery result=$ok');
       setState(() {
         _isDiscovering = false;
       });
     } else {
+      debugPrint('OMNILINK_DART: [t=$t0] startDiscovery requested');
       final granted = await _requestPermissionsWithLogs();
       await _refreshNativeDiagnostics();
 
@@ -85,13 +89,13 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
         return;
       }
       final ok = await adapter.startDiscovery();
-      debugPrint('OMNILINK_PERM: startDiscovery -> $ok');
+      debugPrint('OMNILINK_DART: [t=${DateTime.now().millisecondsSinceEpoch}] startDiscovery result=$ok');
       if (!ok) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text(
-                'Discovery failed to start. Check Bluetooth/Location are ON.',
+                'Discovery failed to start. Ensure Bluetooth, Wi-Fi, and Location are ON.',
               ),
             ),
           );
@@ -104,21 +108,12 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     }
   }
 
-  /// Requests Android runtime permissions with per-permission result logging.
-  ///
-  /// Log tags:
-  /// - OMNILINK_PERM: Requesting permissions (entry)
-  /// - OMNILINK_PERM: <permission> -> <status>   (per result)
-  /// - OMNILINK_PERM: allRequiredPermissionsGranted -> <bool>
-  ///
-  /// Android version branching matches the docs:
-  /// - Android 12+ (API 31): Bluetooth + Location
-  /// - Android 11 and below (API < 31): Location only (BT is install-time)
   Future<bool> _requestPermissionsWithLogs() async {
     try {
-      debugPrint('OMNILINK_PERM: Requesting permissions');
+      final t0 = DateTime.now().millisecondsSinceEpoch;
+      debugPrint('OMNILINK_DART: [t=$t0] Requesting permissions flow...');
       final sdkInt = _diag?.sdkInt ?? _readSdkFromPlatformVersion();
-      debugPrint('OMNILINK_PERM: detected Android SDK = $sdkInt');
+      debugPrint('OMNILINK_DART: detected Android SDK = $sdkInt');
 
       final permissions = <Permission>[
         if (sdkInt >= 31) ...[
@@ -134,20 +129,19 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
 
       for (final permission in permissions) {
         final status = await permission.request();
-        debugPrint('OMNILINK_PERM: ${permission.toString()} -> $status');
+        debugPrint('OMNILINK_DART: ${permission.toString()} -> $status');
         if (!status.isGranted && !status.isRestricted) {
           allGranted = false;
         }
       }
 
-      _permissionDialogObserved = allGranted;
       _lastRequestSummary = allGranted
-          ? 'All required permissions granted. Starting discovery.'
-          : 'Bluetooth and Location permissions are required for offline peer discovery.';
-      debugPrint('OMNILINK_PERM: allRequiredPermissionsGranted -> $allGranted');
+          ? 'All required permissions granted.'
+          : 'Bluetooth, Wi-Fi, and Location permissions are required for peer discovery.';
+      debugPrint('OMNILINK_DART: allRequiredPermissionsGranted -> $allGranted');
       return allGranted;
     } catch (e, s) {
-      debugPrint('OMNILINK_PERM: EXCEPTION in request flow: $e\n$s');
+      debugPrint('OMNILINK_DART: EXCEPTION in request flow: $e\n$s');
       _lastRequestSummary = 'Permission request failed: $e';
       return false;
     }
@@ -164,8 +158,6 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     return 0;
   }
 
-  /// Requests the 4 permissions directly, independent of discovery, so we can
-  /// test whether the system dialog can appear at all.
   Future<void> _requestPermissionsStandalone() async {
     final granted = await _requestPermissionsWithLogs();
     await _refreshNativeDiagnostics();
@@ -200,35 +192,95 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
           granted[key.toString()] = details[key] as bool;
         }
       }
-      setState(() {
-        _diag = PermDiagnostics(
-          sdkInt: (details['sdkInt'] as num?)?.toInt() ?? 0,
-          versionName: details['versionName']?.toString() ?? '?',
-          versionCode: (details['versionCode'] as num?)?.toInt(),
-          permissionGranted: granted,
-          playServicesAvailable: details['playServicesAvailable'] as bool? ?? false,
-          playServicesStatusCode:
-              (details['playServicesStatusCode'] as num?)?.toInt() ?? -1,
-          playServicesUserResolvable:
-              details['playServicesUserResolvable'] as bool? ?? false,
-          bluetoothEnabled: details['bluetoothEnabled'] as bool?,
-          wifiEnabled: details['wifiEnabled'] as bool?,
-          locationEnabled: details['locationEnabled'] as bool?,
-        );
-      });
+      if (mounted) {
+        setState(() {
+          _diag = PermDiagnostics(
+            sdkInt: (details['sdkInt'] as num?)?.toInt() ?? 0,
+            versionName: details['versionName']?.toString() ?? '?',
+            versionCode: (details['versionCode'] as num?)?.toInt(),
+            permissionGranted: granted,
+            playServicesAvailable: details['playServicesAvailable'] as bool? ?? false,
+            playServicesStatusCode:
+                (details['playServicesStatusCode'] as num?)?.toInt() ?? -1,
+            playServicesUserResolvable:
+                details['playServicesUserResolvable'] as bool? ?? false,
+            bluetoothEnabled: details['bluetoothEnabled'] as bool?,
+            wifiEnabled: details['wifiEnabled'] as bool?,
+            locationEnabled: details['locationEnabled'] as bool?,
+          );
+        });
+      }
     } on MissingPluginException catch (e) {
-      debugPrint('OMNILINK_PERM: native diagnostics probe missing: $e');
+      debugPrint('OMNILINK_DART: native diagnostics probe missing: $e');
     } catch (e) {
-      debugPrint('OMNILINK_PERM: native diagnostics probe failed: $e');
+      debugPrint('OMNILINK_DART: native diagnostics probe failed: $e');
     }
   }
 
-  /// [TEMPORARY] Diagnostic card for permission/discovery debugging.
-  /// Shows device environment + permission state + direct action buttons.
-  /// Remove once discovery is verified on physical hardware.
+  /// Fix #3: User-Visible Transport Warning Banner
+  Widget _buildRadioWarningBanner() {
+    final diag = _diag;
+    if (diag == null) return const SizedBox.shrink();
+
+    final List<String> warnings = [];
+    if (diag.bluetoothEnabled == false) warnings.add('Bluetooth is OFF');
+    if (diag.wifiEnabled == false) warnings.add('Wi-Fi is OFF');
+    if (diag.locationEnabled == false) warnings.add('Location is OFF');
+
+    final missingPerms = diag.permissionGranted.entries
+        .where((e) => !e.value)
+        .map((e) => e.key.replaceAll('Granted', ''))
+        .toList();
+    if (missingPerms.isNotEmpty) {
+      warnings.add('Missing Perms: ${missingPerms.join(', ')}');
+    }
+
+    if (warnings.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      color: const Color(0xFFD32F2F),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 24),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'TRANSPORT RADIO WARNING',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    fontSize: 12,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  warnings.join(' • '),
+                  style: const TextStyle(color: Colors.white70, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.white,
+              foregroundColor: Colors.red.shade900,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            ),
+            onPressed: _openAppSettings,
+            child: const Text('Fix', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildDebugCard(dynamic adapter) {
     final diag = _diag;
-    final adapterType = adapter.runtimeType.toString();
 
     String boolLabel(bool? b) => b == null ? '? (no data)' : (b ? 'ON' : 'OFF');
 
@@ -238,14 +290,13 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              const Icon(Icons.bug_report_rounded,
-                  size: 16, color: Colors.orangeAccent),
-              const SizedBox(width: 6),
-              const Expanded(
+              Icon(Icons.bug_report_rounded, size: 16, color: Colors.orangeAccent),
+              SizedBox(width: 6),
+              Expanded(
                 child: Text(
-                  'DIAGNOSTICS (temporary)',
+                  'DIAGNOSTICS & HARDWARE CONTROL',
                   style: TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.bold,
@@ -255,8 +306,8 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                 ),
               ),
               Text(
-                'Adapter: $adapterType',
-                style: const TextStyle(fontSize: 10, color: Colors.white70),
+                'Strategy: P2P_STAR',
+                style: TextStyle(fontSize: 10, color: Color(0xFF00E676), fontWeight: FontWeight.bold),
               ),
             ],
           ),
@@ -285,14 +336,25 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
               _permChip('NEARBY_WIFI', diag?.permissionGranted['nearbyWifiDevicesGranted']),
             ],
           ),
-          const SizedBox(height: 4),
-          Text(
-            'Last request: $_lastRequestSummary',
-            style: const TextStyle(fontSize: 10, color: Colors.white54),
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
           const SizedBox(height: 6),
+          Row(
+            children: [
+              const Icon(Icons.screen_lock_portrait_rounded, size: 14, color: Colors.white70),
+              const SizedBox(width: 6),
+              const Text('Keep Screen Awake during tests', style: TextStyle(fontSize: 11, color: Colors.white70)),
+              const Spacer(),
+              Switch(
+                value: _keepScreenAwake,
+                activeTrackColor: const Color(0xFF00E676),
+                onChanged: (val) {
+                  setState(() {
+                    _keepScreenAwake = val;
+                  });
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
           Wrap(
             spacing: 8,
             runSpacing: 6,
@@ -381,7 +443,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('OMNILINK Mesh'),
+                const Text('OMNILINK Direct'),
                 if (identityState.isLoading)
                   const Text(
                     'Generating Keypair...',
@@ -424,6 +486,8 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             )
           : Column(
               children: [
+                // User-Visible Transport Warning Banner (Fix #3)
+                _buildRadioWarningBanner(),
                 // Status Header Banner
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -441,7 +505,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                       Expanded(
                         child: Text(
                           _isDiscovering
-                              ? 'Scanning physical radios for nearby devices...'
+                              ? 'Scanning physical radios (Strategy.P2P_STAR)...'
                               : 'Discovery stopped. Tap radar button to scan.',
                           style: TextStyle(
                             fontSize: 13,
@@ -556,6 +620,8 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                                           ),
                                         ),
                                         onPressed: () {
+                                          final tConnect = DateTime.now().millisecondsSinceEpoch;
+                                          debugPrint('OMNILINK_DART: [t=$tConnect] connectPeer requested for ${peer.peerId}');
                                           adapter.connectPeer(peer.peerId);
                                         },
                                         child: const Text('Connect'),

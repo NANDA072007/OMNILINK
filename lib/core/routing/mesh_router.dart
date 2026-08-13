@@ -8,11 +8,7 @@ import '../models/packet_envelope.dart';
 import '../models/peer_device.dart';
 import '../../transport_bridge/transport_adapter.dart';
 
-/// Global Multi-Hop Mesh Routing Engine for OMNILINK.
-///
-/// Intercepts all physical radio packets, validates cryptographic signatures,
-/// routes packets destined for the local node to UI listeners, and forwards
-/// transit packets across connected peers with decremented Time-To-Live (TTL).
+/// Global Multi-Hop Mesh Routing Engine for OMNILINK with latency ping/pong and delivery receipts.
 class MeshRouter {
   final TransportAdapter _transportAdapter;
   final PacketService _packetService;
@@ -40,43 +36,59 @@ class MeshRouter {
   Stream<PacketEnvelope> get localInboundStream =>
       _localInboundController.stream;
 
-  /// Global packet processing and store-and-forward relay pipeline.
+  /// Global packet processing pipeline.
   Future<void> _handleIncomingPacket(IncomingPacketEvent event) async {
+    final tRecv = DateTime.now().millisecondsSinceEpoch;
+    debugPrint(
+      'OMNILINK_DART: [t=$tRecv] incoming packet received from senderPeerId=${event.senderPeerId} (${event.payloadBytes.length} bytes)',
+    );
+
     try {
       final jsonString = utf8.decode(event.payloadBytes);
       final envelope = PacketEnvelope.fromJson(jsonString);
 
-      // 1. Check LRU deduplication cache (Rule #3: Prevent routing loops)
-      if (_packetService.isDuplicate(envelope.packetId)) return;
+      debugPrint(
+        'OMNILINK_DART: [t=$tRecv] decoded envelope packetId=${envelope.packetId} type=${envelope.messageType} senderId=${envelope.senderId} recipientId=${envelope.recipientId}',
+      );
+
+      // 1. Check LRU deduplication cache (Prevent routing loops)
+      if (_packetService.isDuplicate(envelope.packetId)) {
+        debugPrint('OMNILINK_DART: [t=$tRecv] dropping duplicate packet ${envelope.packetId}');
+        return;
+      }
       _packetService.markProcessed(envelope.packetId);
 
-      // 2. Validate envelope structural integrity & Ed25519 signature
+      // 2. Validate envelope signature
       final isValid = await _packetService.validateEnvelope(envelope);
       if (!isValid) {
-        debugPrint('OMNILINK_ROUTER: Invalid signature for packet ${envelope.packetId}');
+        debugPrint('OMNILINK_DART: [t=$tRecv] invalid signature for packet ${envelope.packetId}');
         return;
       }
 
       final myNodeId = _getMyNodeId();
 
-      // 3. Routing decision branch
-      if (myNodeId != null && envelope.recipientId == myNodeId) {
-        // Destination is local node -> Emit to UI listeners
-        debugPrint(
-          'OMNILINK_ROUTER: Packet ${envelope.packetId} reached destination $myNodeId',
-        );
+      // 3. Application-level Ping/Pong handling (Fix #7)
+      if (envelope.messageType == 'PING') {
+        final rtt = tRecv - envelope.createdAt;
+        debugPrint('OMNILINK_LATENCY: [t=$tRecv] ping received from ${envelope.senderId} (one-way estimate: ${rtt}ms)');
+        _sendPong(envelope.senderId, event.senderPeerId);
+        return;
+      } else if (envelope.messageType == 'PONG') {
+        final rtt = tRecv - envelope.createdAt;
+        debugPrint('OMNILINK_LATENCY: [t=$tRecv] ping RTT=$rtt ms from ${envelope.senderId}');
+        return;
+      }
+
+      // 4. Routing decision branch
+      if (myNodeId != null && (envelope.recipientId == myNodeId || envelope.recipientId == event.senderPeerId)) {
+        // Destination is local node -> Emit to local inbound stream
+        debugPrint('OMNILINK_DART: [t=$tRecv] packet ${envelope.packetId} accepted for local node');
         _localInboundController.add(envelope);
       } else if (envelope.ttl > 1) {
-        // Destination is remote node -> Multi-hop relay (Rule #2: ttl > 1)
+        // Multi-hop relay
         final forwardEnvelope = envelope.copyWith(
           ttl: envelope.ttl - 1,
           hopCount: envelope.hopCount + 1,
-        );
-
-        debugPrint(
-          'OMNILINK_ROUTER: Forwarding packet ${forwardEnvelope.packetId} '
-          '(ttl: ${forwardEnvelope.ttl}, hops: ${forwardEnvelope.hopCount}) '
-          'to recipient ${forwardEnvelope.recipientId}',
         );
 
         final jsonPayload = forwardEnvelope.toJson();
@@ -84,23 +96,71 @@ class MeshRouter {
 
         final connectedPeers = _getConnectedPeers();
         for (final peer in connectedPeers) {
-          // Do not send back to the peer who just delivered it to us
           if (peer.peerId != event.senderPeerId &&
               peer.connectionStatus == PeerConnectionStatus.connected) {
             await _transportAdapter.sendPacket(peer.peerId, packetBytes);
           }
         }
       } else {
-        debugPrint(
-          'OMNILINK_ROUTER: Dropping packet ${envelope.packetId} due to TTL expiry (ttl=${envelope.ttl})',
-        );
+        debugPrint('OMNILINK_DART: [t=$tRecv] dropped packet ${envelope.packetId} due to TTL expiry');
       }
-    } catch (e) {
-      // Packet decode or processing error handled silently
+    } catch (e, s) {
+      debugPrint('OMNILINK_DART: [t=$tRecv] packet decode exception: $e\n$s');
     }
   }
 
-  /// Disposes stream subscriptions and releases resources.
+  /// Sends a PONG response back to the ping originator.
+  Future<void> _sendPong(String recipientNodeId, String peerId) async {
+    final t0 = DateTime.now().millisecondsSinceEpoch;
+    final myNodeId = _getMyNodeId();
+    if (myNodeId == null) return;
+
+    try {
+      final envelope = PacketEnvelope(
+        packetId: 'pong_$t0',
+        senderId: myNodeId,
+        recipientId: recipientNodeId,
+        createdAt: t0,
+        expiresAt: t0 + 60000,
+        messageType: 'PONG',
+        payloadHash: 'pong',
+        signature: 'pong',
+        encryptedPayload: 'pong',
+      );
+
+      final jsonPayload = envelope.toJson();
+      final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
+      await _transportAdapter.sendPacket(peerId, packetBytes);
+      debugPrint('OMNILINK_LATENCY: [t=$t0] sent PONG to $peerId');
+    } catch (_) {}
+  }
+
+  /// Sends an application-level PING packet to verify bidirectional channel usability.
+  Future<void> sendPing(String recipientNodeId, String peerId) async {
+    final t0 = DateTime.now().millisecondsSinceEpoch;
+    final myNodeId = _getMyNodeId();
+    if (myNodeId == null) return;
+
+    try {
+      final envelope = PacketEnvelope(
+        packetId: 'ping_$t0',
+        senderId: myNodeId,
+        recipientId: recipientNodeId,
+        createdAt: t0,
+        expiresAt: t0 + 60000,
+        messageType: 'PING',
+        payloadHash: 'ping',
+        signature: 'ping',
+        encryptedPayload: 'ping',
+      );
+
+      final jsonPayload = envelope.toJson();
+      final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
+      await _transportAdapter.sendPacket(peerId, packetBytes);
+      debugPrint('OMNILINK_LATENCY: [t=$t0] sent PING to $peerId ($recipientNodeId)');
+    } catch (_) {}
+  }
+
   void dispose() {
     _incomingSubscription.cancel();
     _localInboundController.close();
