@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
@@ -7,17 +6,20 @@ import '../crypto/packet_service.dart';
 import '../models/message.dart';
 import '../repositories/message_repository.dart';
 import '../repositories/outbox_repository.dart';
+
 import '../../transport_bridge/transport_adapter.dart';
+import 'mesh_router.dart';
 
 /// Store-and-Forward Daemon managing background outbox queue retries.
 ///
 /// Listens to physical radio connection events and automatically flushes
-/// queued packets whenever a radio link is re-established with a recipient peer.
+/// queued packets whenever a radio link is re-established with any peer node.
 class OutboxDaemon {
   final TransportAdapter _transportAdapter;
   final OutboxRepository _outboxRepo;
   final MessageRepository _messageRepo;
   final PacketService _packetService;
+  final MeshRouter _meshRouter;
 
   late final StreamSubscription<PeerConnectionEvent> _peerSubscription;
 
@@ -26,10 +28,12 @@ class OutboxDaemon {
     required OutboxRepository outboxRepo,
     required MessageRepository messageRepo,
     required PacketService packetService,
+    required MeshRouter meshRouter,
   })  : _transportAdapter = transportAdapter,
         _outboxRepo = outboxRepo,
         _messageRepo = messageRepo,
-        _packetService = packetService {
+        _packetService = packetService,
+        _meshRouter = meshRouter {
     _peerSubscription = _transportAdapter.peerEvents.listen(_handlePeerEvent);
   }
 
@@ -47,30 +51,26 @@ class OutboxDaemon {
   Future<int> flushOutboxForPeer(String peerId) async {
     int deliveredCount = 0;
     try {
-      // Fetch queued packets targeting this peer endpoint / node ID
-      final pendingPackets = await _outboxRepo.getPendingPacketsForRecipient(peerId);
-      final candidatePackets = pendingPackets.isNotEmpty
-          ? pendingPackets
-          : await _outboxRepo.getAllPendingPackets();
+      final candidatePackets = await _outboxRepo.getAllPendingPackets();
+      if (candidatePackets.isEmpty) return 0;
+
+      debugPrint('OMNILINK_OUTBOX: Found ${candidatePackets.length} pending packet(s) in outbox_queue to flush via $peerId');
 
       for (final envelope in candidatePackets) {
-        // Skip if already in deduplication ring buffer (Rule #2: Do not send duplicate packets)
+        // Skip if already in deduplication ring buffer (Prevent duplicate sends)
         if (_packetService.isDuplicate(envelope.packetId)) {
           await _outboxRepo.removeFromOutbox(envelope.packetId);
           continue;
         }
 
-        final jsonPayload = envelope.toJson();
-        final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
-
-        // Attempt transmission over native radio
-        final success = await _transportAdapter.sendPacket(peerId, packetBytes);
+        // Transmit envelope via MeshRouter (Direct or Blind Flooding relay)
+        final success = await _meshRouter.broadcastEnvelope(envelope, targetPeerId: peerId);
 
         if (success) {
           debugPrint(
-            'OMNILINK_OUTBOX: Successfully flushed queued packet ${envelope.packetId} to $peerId',
+            'OMNILINK_OUTBOX: Successfully flushed queued packet ${envelope.packetId} to/via $peerId',
           );
-          // Delete from outbox_queue table
+          // Remove from outbox_queue table
           await _outboxRepo.removeFromOutbox(envelope.packetId);
           // Update SQLite message state to delivered
           await _messageRepo.updateMessageState(
@@ -82,8 +82,8 @@ class OutboxDaemon {
           await _outboxRepo.incrementAttemptCount(envelope.packetId);
         }
       }
-    } catch (e) {
-      debugPrint('OMNILINK_OUTBOX: Error flushing outbox for $peerId: $e');
+    } catch (e, s) {
+      debugPrint('OMNILINK_OUTBOX: Error flushing outbox for $peerId: $e\n$s');
     }
     return deliveredCount;
   }

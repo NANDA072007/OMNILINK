@@ -47,7 +47,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     super.dispose();
   }
 
-  /// Sends application-level PING on chat open to test bidirectional channel (Fix #7).
+  /// Sends application-level PING on chat open to test bidirectional channel.
   void _sendInitialPing() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final router = ref.read(meshRouterProvider);
@@ -61,13 +61,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     _envelopeSubscription = router.localInboundStream.listen(_handleIncomingEnvelope);
   }
 
-  /// Processes pre-validated incoming envelopes routed specifically to this local device (Fix #9, #13).
+  /// Processes pre-validated incoming envelopes routed specifically to this local device.
   Future<void> _handleIncomingEnvelope(PacketEnvelope envelope) async {
     final tRecv = DateTime.now().millisecondsSinceEpoch;
     debugPrint('OMNILINK_DART: [t=$tRecv] incoming packet senderPeerId=${envelope.senderId}');
     debugPrint('OMNILINK_DART: [t=$tRecv] current chat peerId=${widget.peerId}');
 
-    // Filter matching peer (allow prefix matching for Node ID / endpoint ID) (Fix #9)
+    // Filter matching peer (allow prefix matching for Node ID / endpoint ID)
     final isMatchingPeer = envelope.senderId == widget.peerId ||
         envelope.senderId.startsWith(widget.peerId) ||
         widget.peerId.startsWith(envelope.senderId);
@@ -80,7 +80,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     try {
       final messageRepo = ref.read(messageRepositoryProvider);
 
-      // Handle DELIVERY_RECEIPT (Fix #8)
+      // Handle DELIVERY_RECEIPT
       if (envelope.messageType == 'DELIVERY_RECEIPT') {
         final originalPacketId = envelope.encryptedPayload;
         debugPrint('OMNILINK_DART: [t=$tRecv] received DELIVERY_RECEIPT for packetId=$originalPacketId');
@@ -124,7 +124,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         await messageRepo.saveMessage(receivedMessage);
         debugPrint('OMNILINK_DART: [t=$tRecv] message ${envelope.packetId} decrypted and saved to SQLite');
 
-        // 2. Send back DELIVERY_RECEIPT to sender (Fix #8)
+        // 2. Send back DELIVERY_RECEIPT to sender
         _sendDeliveryReceipt(envelope.senderId, envelope.packetId);
 
         // 3. Trigger reactive update for this conversation thread
@@ -138,7 +138,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
   }
 
-  /// Sends cryptographic DELIVERY_RECEIPT back to message originator (Fix #8).
+  /// Sends cryptographic DELIVERY_RECEIPT back to message originator.
   Future<void> _sendDeliveryReceipt(String recipientId, String messageId) async {
     final t0 = DateTime.now().millisecondsSinceEpoch;
     final identityState = ref.read(identityProvider);
@@ -157,11 +157,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         encryptedPayload: messageId,
       );
 
-      final jsonPayload = envelope.toJson();
-      final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
-      final adapter = ref.read(transportAdapterProvider);
-      await adapter.sendPacket(widget.peerId, packetBytes);
-      debugPrint('OMNILINK_DART: [t=$t0] sent DELIVERY_RECEIPT for $messageId to ${widget.peerId}');
+      final router = ref.read(meshRouterProvider);
+      await router.broadcastEnvelope(envelope, targetPeerId: widget.peerId);
+      debugPrint('OMNILINK_DART: [t=$t0] sent DELIVERY_RECEIPT for $messageId to $recipientId');
     } catch (e) {
       debugPrint('OMNILINK_DART: [t=$t0] failed to send DELIVERY_RECEIPT: $e');
     }
@@ -186,16 +184,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     ref.read(outboxDaemonProvider);
 
     final peerList = ref.read(peerListProvider);
-    final isPeerConnected = peerList.any(
-      (p) => p.peerId == widget.peerId && p.connectionStatus == PeerConnectionStatus.connected,
+    final hasConnectedPeers = peerList.any(
+      (p) => p.connectionStatus == PeerConnectionStatus.connected,
     );
 
     final messageId = _uuid.v4();
     final messageRepo = ref.read(messageRepositoryProvider);
     final outboxRepo = ref.read(outboxRepositoryProvider);
+    final router = ref.read(meshRouterProvider);
 
     final initialMessageState =
-        isPeerConnected ? MessageState.sending : MessageState.queued;
+        hasConnectedPeers ? MessageState.sending : MessageState.queued;
 
     final draftMessage = Message(
       messageId: messageId,
@@ -213,7 +212,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
     _scrollToBottom();
 
-    debugPrint('OMNILINK_DART: [t=$t0] _sendMessage called messageId=$messageId peerId=${widget.peerId} isConnected=$isPeerConnected');
+    debugPrint('OMNILINK_DART: [t=$t0] _sendMessage called messageId=$messageId peerId=${widget.peerId} hasConnectedPeers=$hasConnectedPeers');
 
     try {
       final cryptoService = ref.read(cryptoServiceProvider);
@@ -237,22 +236,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         senderKeyPair: masterKeyPair,
       );
 
-      if (isPeerConnected) {
-        final jsonString = envelope.toJson();
-        final packetBytes = Uint8List.fromList(utf8.encode(jsonString));
+      // Transmit envelope via MeshRouter (Direct link or Blind Flooding relay)
+      final success = await router.broadcastEnvelope(envelope, targetPeerId: widget.peerId);
 
-        final adapter = ref.read(transportAdapterProvider);
-        debugPrint('OMNILINK_DART: [t=${DateTime.now().millisecondsSinceEpoch}] transmitting packet $messageId (${packetBytes.length} bytes) to ${widget.peerId}');
-        final success = await adapter.sendPacket(widget.peerId, packetBytes);
-
-        if (success) {
-          await messageRepo.updateMessageState(messageId, MessageState.delivered);
-          _scheduleReceiptTimeoutAndRetry(messageId, envelope, packetBytes);
-        } else {
-          await messageRepo.updateMessageState(messageId, MessageState.queued);
-          await outboxRepo.saveToOutbox(envelope);
-        }
+      if (success) {
+        await messageRepo.updateMessageState(messageId, MessageState.delivered);
+        _scheduleReceiptTimeoutAndRetry(messageId, envelope);
       } else {
+        // No connected peers or link error -> Queue in SQLite outbox
+        await messageRepo.updateMessageState(messageId, MessageState.queued);
         await outboxRepo.saveToOutbox(envelope);
       }
     } catch (e) {
@@ -264,8 +256,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
   }
 
-  /// Receipt timeout and single retry (Fix #8: 5 seconds timeout).
-  void _scheduleReceiptTimeoutAndRetry(String messageId, PacketEnvelope envelope, Uint8List packetBytes) {
+  /// Receipt timeout and single retry (5 seconds timeout).
+  void _scheduleReceiptTimeoutAndRetry(String messageId, PacketEnvelope envelope) {
     Timer(const Duration(seconds: 5), () async {
       final messageRepo = ref.read(messageRepositoryProvider);
       final conversationMessages = await messageRepo.getMessagesForConversation(widget.peerId);
@@ -284,9 +276,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
       if (currentMsg.state != MessageState.receiptReceived) {
         final tRetry = DateTime.now().millisecondsSinceEpoch;
-        debugPrint('OMNILINK_DART: [t=$tRetry] No receipt in 5s for $messageId. Executing SINGLE RETRY...');
-        final adapter = ref.read(transportAdapterProvider);
-        final retrySuccess = await adapter.sendPacket(widget.peerId, packetBytes);
+        debugPrint('OMNILINK_DART: [t=$tRetry] No receipt in 5s for $messageId. Executing SINGLE RETRY via MeshRouter...');
+        final router = ref.read(meshRouterProvider);
+        final retrySuccess = await router.broadcastEnvelope(envelope, targetPeerId: widget.peerId);
 
         if (!retrySuccess) {
           await messageRepo.updateMessageState(messageId, MessageState.failed);
@@ -320,7 +312,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       case MessageState.searchingForPeer:
         return const Text('⏳', style: TextStyle(fontSize: 12));
       case MessageState.queued:
-        return const Text('⏳ Queued', style: TextStyle(fontSize: 11, color: Colors.orangeAccent));
+        return const Text('⏳ Queued for delivery', style: TextStyle(fontSize: 11, color: Colors.orangeAccent));
       case MessageState.sending:
         return const Text('✓', style: TextStyle(fontSize: 12, color: Colors.grey));
       case MessageState.delivered:
@@ -379,7 +371,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                         ),
                         const SizedBox(height: 4),
                         const Text(
-                          'ChaCha20-Poly1305 • Strategy.P2P_STAR • Latency Ping & Receipts',
+                          'ChaCha20-Poly1305 • Blind Flooding Mesh Relay • Store-and-Forward',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],

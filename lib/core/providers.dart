@@ -254,6 +254,7 @@ final outboxDaemonProvider = Provider<OutboxDaemon>((ref) {
     outboxRepo: ref.watch(outboxRepositoryProvider),
     messageRepo: ref.watch(messageRepositoryProvider),
     packetService: ref.watch(packetServiceProvider),
+    meshRouter: ref.watch(meshRouterProvider),
   );
   ref.onDispose(() => daemon.dispose());
   return daemon;
