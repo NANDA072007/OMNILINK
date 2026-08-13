@@ -29,7 +29,6 @@ class ChatScreen extends ConsumerStatefulWidget {
 class _ChatScreenState extends ConsumerState<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
-  final List<Message> _messages = [];
   final Uuid _uuid = const Uuid();
   StreamSubscription<IncomingPacketEvent>? _packetSubscription;
 
@@ -54,11 +53,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   /// Handles incoming raw byte packet from native transport layer.
   Future<void> _handleIncomingPacket(IncomingPacketEvent event) async {
-    debugPrint(
-      'OMNILINK_DART: Chat UI received incoming packet from '
-      '${event.senderPeerId} with ${event.payloadBytes.length} bytes',
-    );
-
     // Only process packets received from this peer
     if (event.senderPeerId != widget.peerId) return;
 
@@ -78,7 +72,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       if (!isValid) return;
 
       if (envelope.messageType == 'MESSAGE_PAYLOAD') {
-        // Derive symmetric encryption key for decryption
+        // Derive symmetric key for payload decryption
         final keySeed = await cryptoService.sha256Hex(
           Uint8List.fromList(
             utf8.encode('${envelope.senderId}:${envelope.recipientId}'),
@@ -104,10 +98,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           updatedAt: DateTime.now(),
         );
 
+        // 1. Save received message to SQLite database
+        final messageRepo = ref.read(messageRepositoryProvider);
+        await messageRepo.saveMessage(receivedMessage);
+
+        // 2. Trigger reactive update for this conversation
         if (mounted) {
-          setState(() {
-            _messages.add(receivedMessage);
-          });
+          ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
           _scrollToBottom();
         }
       }
@@ -132,23 +129,25 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
 
     final messageId = _uuid.v4();
+    final messageRepo = ref.read(messageRepositoryProvider);
+    final outboxRepo = ref.read(outboxRepositoryProvider);
 
-    // 1. Create Message with state MessageState.draft
-    final draftMessage = Message(
+    // 1. Create Message record with state MessageState.sending
+    final sendingMessage = Message(
       messageId: messageId,
       conversationId: widget.peerId,
       senderNodeId: myNodeId,
       recipientNodeId: widget.peerId,
       plaintextBody: text,
-      state: MessageState.draft,
+      state: MessageState.sending,
       createdAt: DateTime.now(),
       updatedAt: DateTime.now(),
     );
 
-    setState(() {
-      _messages.add(draftMessage);
-      _textController.clear();
-    });
+    // 2. Save message to SQLite database BEFORE transmitting
+    await messageRepo.saveMessage(sendingMessage);
+    _textController.clear();
+    ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
     _scrollToBottom();
 
     try {
@@ -176,9 +175,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         senderKeyPair: masterKeyPair,
       );
 
-      // Update local message state to sending
-      _updateMessageState(messageId, MessageState.sending);
-
       // Serialize envelope to JSON bytes and send via transport
       final jsonString = envelope.toJson();
       final packetBytes = Uint8List.fromList(utf8.encode(jsonString));
@@ -187,26 +183,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       final success = await adapter.sendPacket(widget.peerId, packetBytes);
 
       if (success) {
-        _updateMessageState(messageId, MessageState.delivered);
+        // 3a. Update SQLite message state to delivered
+        await messageRepo.updateMessageState(messageId, MessageState.delivered);
       } else {
-        _updateMessageState(messageId, MessageState.failed);
+        // 3b. Update SQLite message state to failed and save to outbox queue
+        await messageRepo.updateMessageState(messageId, MessageState.failed);
+        await outboxRepo.saveToOutbox(envelope);
       }
     } catch (e) {
-      _updateMessageState(messageId, MessageState.failed);
+      await messageRepo.updateMessageState(messageId, MessageState.failed);
     }
-  }
 
-  void _updateMessageState(String messageId, MessageState newState) {
-    if (!mounted) return;
-    setState(() {
-      final index = _messages.indexWhere((m) => m.messageId == messageId);
-      if (index != -1) {
-        _messages[index] = _messages[index].copyWith(
-          state: newState,
-          updatedAt: DateTime.now(),
-        );
-      }
-    });
+    if (mounted) {
+      ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
+    }
   }
 
   void _scrollToBottom() {
@@ -244,6 +234,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     final identityState = ref.watch(identityProvider);
+    final messages = ref.watch(conversationMessagesProvider(widget.peerId));
+
     final myNodeId = identityState.nodeId;
     final titleName = widget.peerName ?? widget.peerId;
 
@@ -263,7 +255,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: _messages.isEmpty
+            child: messages.isEmpty
                 ? Center(
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -293,9 +285,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.all(16),
-                    itemCount: _messages.length,
+                    itemCount: messages.length,
                     itemBuilder: (context, index) {
-                      final msg = _messages[index];
+                      final msg = messages[index];
                       final isMe = msg.senderNodeId == myNodeId;
 
                       return Align(

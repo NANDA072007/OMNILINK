@@ -7,13 +7,32 @@ import '../transport_bridge/android_transport_adapter.dart';
 import '../transport_bridge/transport_adapter.dart';
 import 'crypto/crypto_service.dart';
 import 'crypto/packet_service.dart';
+import 'database/database_service.dart';
+import 'models/message.dart';
 import 'models/peer_device.dart';
+import 'repositories/message_repository.dart';
+import 'repositories/outbox_repository.dart';
+import 'repositories/peer_repository.dart';
 
-// 1. Core Services
+// 1. Core Services & Database
 final cryptoServiceProvider = Provider<CryptoService>((ref) => CryptoService());
 
 final packetServiceProvider = Provider<PacketService>((ref) {
   return PacketService(cryptoService: ref.watch(cryptoServiceProvider));
+});
+
+final databaseServiceProvider = Provider<DatabaseService>((ref) => DatabaseService.instance);
+
+final peerRepositoryProvider = Provider<PeerRepository>((ref) {
+  return PeerRepository(dbService: ref.watch(databaseServiceProvider));
+});
+
+final messageRepositoryProvider = Provider<MessageRepository>((ref) {
+  return MessageRepository(dbService: ref.watch(databaseServiceProvider));
+});
+
+final outboxRepositoryProvider = Provider<OutboxRepository>((ref) {
+  return OutboxRepository(dbService: ref.watch(databaseServiceProvider));
 });
 
 // 2. Transport Adapter (Android Native Radio Transport)
@@ -93,32 +112,51 @@ final identityProvider = StateNotifierProvider<IdentityNotifier, IdentityState>(
   );
 });
 
-// 4. Peer Discovery State
+// 4. Peer Discovery & Persistence State
 class PeerListNotifier extends StateNotifier<List<PeerDevice>> {
   final TransportAdapter _adapter;
+  final PeerRepository _peerRepository;
   late final StreamSubscription _subscription;
 
-  PeerListNotifier(this._adapter) : super([]) {
+  PeerListNotifier(this._adapter, this._peerRepository) : super([]) {
+    _loadSavedPeers();
     _subscription = _adapter.peerEvents.listen(_handleEvent);
+  }
+
+  Future<void> _loadSavedPeers() async {
+    final savedPeers = await _peerRepository.getAllPeers();
+    if (savedPeers.isNotEmpty) {
+      state = savedPeers;
+    }
   }
 
   void _handleEvent(PeerConnectionEvent event) {
     final now = DateTime.now();
     switch (event.eventType) {
       case PeerConnectionEventType.onPeerFound:
-        if (!state.any((p) => p.peerId == event.peerId)) {
+        final existingIndex = state.indexWhere((p) => p.peerId == event.peerId);
+        PeerDevice peer;
+        if (existingIndex == -1) {
+          peer = PeerDevice(
+            peerId: event.peerId,
+            friendlyName: event.friendlyName ?? 'Unknown',
+            lastSeenAt: now,
+            rssi: event.rssi,
+            transportType: event.transportType,
+            connectionStatus: PeerConnectionStatus.discovered,
+          );
+          state = [...state, peer];
+        } else {
+          peer = state[existingIndex].copyWith(
+            lastSeenAt: now,
+            rssi: event.rssi ?? state[existingIndex].rssi,
+          );
           state = [
-            ...state,
-            PeerDevice(
-              peerId: event.peerId,
-              friendlyName: event.friendlyName ?? 'Unknown',
-              lastSeenAt: now,
-              rssi: event.rssi,
-              transportType: event.transportType,
-              connectionStatus: PeerConnectionStatus.discovered,
-            ),
+            for (final p in state)
+              if (p.peerId == event.peerId) peer else p
           ];
         }
+        _peerRepository.savePeer(peer);
         break;
 
       case PeerConnectionEventType.onPeerLost:
@@ -133,6 +171,10 @@ class PeerListNotifier extends StateNotifier<List<PeerDevice>> {
             else
               p
         ];
+        final connectedIndex = state.indexWhere((p) => p.peerId == event.peerId);
+        if (connectedIndex != -1) {
+          _peerRepository.savePeer(state[connectedIndex]);
+        }
         break;
 
       case PeerConnectionEventType.onDisconnected:
@@ -143,6 +185,10 @@ class PeerListNotifier extends StateNotifier<List<PeerDevice>> {
             else
               p
         ];
+        final disconnectedIndex = state.indexWhere((p) => p.peerId == event.peerId);
+        if (disconnectedIndex != -1) {
+          _peerRepository.savePeer(state[disconnectedIndex]);
+        }
         break;
 
       case PeerConnectionEventType.onError:
@@ -158,5 +204,31 @@ class PeerListNotifier extends StateNotifier<List<PeerDevice>> {
 }
 
 final peerListProvider = StateNotifierProvider<PeerListNotifier, List<PeerDevice>>((ref) {
-  return PeerListNotifier(ref.watch(transportAdapterProvider));
+  return PeerListNotifier(
+    ref.watch(transportAdapterProvider),
+    ref.watch(peerRepositoryProvider),
+  );
+});
+
+// 5. Conversation Message State (SQLite Backed)
+class ConversationMessagesNotifier extends StateNotifier<List<Message>> {
+  final String conversationId;
+  final MessageRepository _messageRepo;
+
+  ConversationMessagesNotifier(this.conversationId, this._messageRepo) : super([]) {
+    loadMessages();
+  }
+
+  Future<void> loadMessages() async {
+    final messages = await _messageRepo.getMessagesForConversation(conversationId);
+    state = messages;
+  }
+}
+
+final conversationMessagesProvider = StateNotifierProvider.family<
+    ConversationMessagesNotifier, List<Message>, String>((ref, conversationId) {
+  return ConversationMessagesNotifier(
+    conversationId,
+    ref.watch(messageRepositoryProvider),
+  );
 });
