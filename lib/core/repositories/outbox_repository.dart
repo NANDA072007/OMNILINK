@@ -78,4 +78,33 @@ class OutboxRepository {
       );
     }
   }
+
+  /// Retrieves a specific [PacketEnvelope] from the outbox queue by packetId.
+  Future<PacketEnvelope?> getEnvelopeByPacketId(String packetId) async {
+    final rows = await _dbService.query(
+      'outbox_queue',
+      where: 'packet_id = ?',
+      whereArgs: [packetId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return PacketEnvelope.fromJson(rows.first['envelope_json'] as String);
+  }
+
+  /// Retrieves all packet IDs currently stored in the outbox queue and messages table.
+  Future<Set<String>> getAllKnownPacketIds() async {
+    final outboxRows = await _dbService.query('outbox_queue');
+    final messageRows = await _dbService.query('messages');
+
+    final ids = <String>{};
+    for (final row in outboxRows) {
+      final id = row['packet_id'] as String?;
+      if (id != null) ids.add(id);
+    }
+    for (final row in messageRows) {
+      final id = row['message_id'] as String?;
+      if (id != null) ids.add(id);
+    }
+    return ids;
+  }
 }

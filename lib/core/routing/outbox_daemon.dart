@@ -2,38 +2,28 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
-import '../crypto/packet_service.dart';
-import '../models/message.dart';
-import '../repositories/message_repository.dart';
-import '../repositories/outbox_repository.dart';
-
+import '../models/peer_device.dart';
 import '../../transport_bridge/transport_adapter.dart';
 import 'mesh_router.dart';
 
-/// Store-and-Forward Daemon managing background outbox queue retries.
+/// Store-and-Forward Daemon managing Epidemic Anti-Entropy Summary Vector Exchanges.
 ///
-/// Listens to physical radio connection events and automatically flushes
-/// queued packets whenever a radio link is re-established with any peer node.
+/// Listens to physical radio connection events and automatically initiates anti-entropy
+/// handshakes whenever radio links connect or local outbox messages are queued.
 class OutboxDaemon {
   final TransportAdapter _transportAdapter;
-  final OutboxRepository _outboxRepo;
-  final MessageRepository _messageRepo;
-  final PacketService _packetService;
   final MeshRouter _meshRouter;
+  final List<PeerDevice> Function() _getConnectedPeers;
 
   late final StreamSubscription<PeerConnectionEvent> _peerSubscription;
 
   OutboxDaemon({
     required TransportAdapter transportAdapter,
-    required OutboxRepository outboxRepo,
-    required MessageRepository messageRepo,
-    required PacketService packetService,
     required MeshRouter meshRouter,
+    required List<PeerDevice> Function() getConnectedPeers,
   })  : _transportAdapter = transportAdapter,
-        _outboxRepo = outboxRepo,
-        _messageRepo = messageRepo,
-        _packetService = packetService,
-        _meshRouter = meshRouter {
+        _meshRouter = meshRouter,
+        _getConnectedPeers = getConnectedPeers {
     _peerSubscription = _transportAdapter.peerEvents.listen(_handlePeerEvent);
   }
 
@@ -41,51 +31,25 @@ class OutboxDaemon {
   Future<void> _handlePeerEvent(PeerConnectionEvent event) async {
     if (event.eventType == PeerConnectionEventType.onConnected) {
       debugPrint(
-        'OMNILINK_OUTBOX: Peer connected (${event.peerId}). Flushing pending outbox packets...',
+        'OMNILINK_OUTBOX: Peer connected (${event.peerId}). Initiating Anti-Entropy Handshake...',
       );
-      await flushOutboxForPeer(event.peerId);
+      await _meshRouter.sendSyncHandshake(event.peerId);
     }
   }
 
-  /// Flushes pending outbox envelopes targeting a specific peer endpoint or node ID.
-  Future<int> flushOutboxForPeer(String peerId) async {
-    int deliveredCount = 0;
-    try {
-      final candidatePackets = await _outboxRepo.getAllPendingPackets();
-      if (candidatePackets.isEmpty) return 0;
+  /// Triggers an Anti-Entropy Summary Vector Sync across all currently connected radio links.
+  Future<void> triggerAntiEntropySync() async {
+    final connectedPeers = _getConnectedPeers()
+        .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
+        .toList();
 
-      debugPrint('OMNILINK_OUTBOX: Found ${candidatePackets.length} pending packet(s) in outbox_queue to flush via $peerId');
+    debugPrint(
+      'OMNILINK_OUTBOX: Triggering Anti-Entropy Sync across ${connectedPeers.length} active peer(s)...',
+    );
 
-      for (final envelope in candidatePackets) {
-        // Skip if already in deduplication ring buffer (Prevent duplicate sends)
-        if (_packetService.isDuplicate(envelope.packetId)) {
-          await _outboxRepo.removeFromOutbox(envelope.packetId);
-          continue;
-        }
-
-        // Transmit envelope via MeshRouter (Direct or Blind Flooding relay)
-        final success = await _meshRouter.broadcastEnvelope(envelope, targetPeerId: peerId);
-
-        if (success) {
-          debugPrint(
-            'OMNILINK_OUTBOX: Successfully flushed queued packet ${envelope.packetId} to/via $peerId',
-          );
-          // Remove from outbox_queue table
-          await _outboxRepo.removeFromOutbox(envelope.packetId);
-          // Update SQLite message state to delivered
-          await _messageRepo.updateMessageState(
-            envelope.packetId,
-            MessageState.delivered,
-          );
-          deliveredCount++;
-        } else {
-          await _outboxRepo.incrementAttemptCount(envelope.packetId);
-        }
-      }
-    } catch (e, s) {
-      debugPrint('OMNILINK_OUTBOX: Error flushing outbox for $peerId: $e\n$s');
+    for (final peer in connectedPeers) {
+      await _meshRouter.sendSyncHandshake(peer.peerId);
     }
-    return deliveredCount;
   }
 
   /// Disposes stream subscription.

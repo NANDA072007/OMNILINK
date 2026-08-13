@@ -9,7 +9,6 @@ import 'package:uuid/uuid.dart';
 
 import '../../core/models/message.dart';
 import '../../core/models/packet_envelope.dart';
-import '../../core/models/peer_device.dart';
 import '../../core/providers.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
@@ -181,28 +180,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       return;
     }
 
-    ref.read(outboxDaemonProvider);
-
-    final peerList = ref.read(peerListProvider);
-    final hasConnectedPeers = peerList.any(
-      (p) => p.connectionStatus == PeerConnectionStatus.connected,
-    );
-
+    final daemon = ref.read(outboxDaemonProvider);
     final messageId = _uuid.v4();
     final messageRepo = ref.read(messageRepositoryProvider);
     final outboxRepo = ref.read(outboxRepositoryProvider);
-    final router = ref.read(meshRouterProvider);
 
-    final initialMessageState =
-        hasConnectedPeers ? MessageState.sending : MessageState.queued;
-
+    // 1. INSTANT LOCAL SAVE & UI REFRESH (< 20ms execution)
     final draftMessage = Message(
       messageId: messageId,
       conversationId: widget.peerId,
       senderNodeId: myNodeId,
       recipientNodeId: widget.peerId,
       plaintextBody: text,
-      state: initialMessageState,
+      state: MessageState.queued,
       createdAt: DateTime.now(),
       updatedAt: DateTime.now(),
     );
@@ -212,85 +202,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
     _scrollToBottom();
 
-    debugPrint('OMNILINK_DART: [t=$t0] _sendMessage called messageId=$messageId peerId=${widget.peerId} hasConnectedPeers=$hasConnectedPeers');
+    debugPrint('OMNILINK_UI: [t=$t0] Instant UI send complete for messageId=$messageId');
 
-    try {
-      final cryptoService = ref.read(cryptoServiceProvider);
-      final packetService = ref.read(packetServiceProvider);
+    // 2. ASYNCHRONOUS BACKGROUND ENCRYPTION & EPIDEMIC OUTBOX SYNC (Non-blocking)
+    unawaited(() async {
+      try {
+        final cryptoService = ref.read(cryptoServiceProvider);
+        final packetService = ref.read(packetServiceProvider);
 
-      final keySeed = await cryptoService.sha256Hex(
-        Uint8List.fromList(utf8.encode('$myNodeId:${widget.peerId}')),
-      );
-      final secretKey = SecretKey(utf8.encode(keySeed.substring(0, 32)));
+        final keySeed = await cryptoService.sha256Hex(
+          Uint8List.fromList(utf8.encode('$myNodeId:${widget.peerId}')),
+        );
+        final secretKey = SecretKey(utf8.encode(keySeed.substring(0, 32)));
 
-      final encryptedPayloadBase64 = await cryptoService.encryptPayload(
-        plaintext: Uint8List.fromList(utf8.encode(text)),
-        secretKey: secretKey,
-      );
+        final encryptedPayloadBase64 = await cryptoService.encryptPayload(
+          plaintext: Uint8List.fromList(utf8.encode(text)),
+          secretKey: secretKey,
+        );
 
-      final envelope = await packetService.createEnvelope(
-        senderNodeId: myNodeId,
-        recipientNodeId: widget.peerId,
-        messageType: 'MESSAGE_PAYLOAD',
-        encryptedPayloadBase64: encryptedPayloadBase64,
-        senderKeyPair: masterKeyPair,
-      );
-
-      // Transmit envelope via MeshRouter (Direct link or Blind Flooding relay)
-      final success = await router.broadcastEnvelope(envelope, targetPeerId: widget.peerId);
-
-      if (success) {
-        await messageRepo.updateMessageState(messageId, MessageState.delivered);
-        _scheduleReceiptTimeoutAndRetry(messageId, envelope);
-      } else {
-        // No connected peers or link error -> Queue in SQLite outbox
-        await messageRepo.updateMessageState(messageId, MessageState.queued);
-        await outboxRepo.saveToOutbox(envelope);
-      }
-    } catch (e) {
-      await messageRepo.updateMessageState(messageId, MessageState.queued);
-    }
-
-    if (mounted) {
-      ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
-    }
-  }
-
-  /// Receipt timeout and single retry (5 seconds timeout).
-  void _scheduleReceiptTimeoutAndRetry(String messageId, PacketEnvelope envelope) {
-    Timer(const Duration(seconds: 5), () async {
-      final messageRepo = ref.read(messageRepositoryProvider);
-      final conversationMessages = await messageRepo.getMessagesForConversation(widget.peerId);
-      final currentMsg = conversationMessages.firstWhere(
-        (m) => m.messageId == messageId,
-        orElse: () => Message(
-          messageId: messageId,
-          conversationId: widget.peerId,
-          senderNodeId: 'me',
+        final envelope = await packetService.createEnvelope(
+          senderNodeId: myNodeId,
           recipientNodeId: widget.peerId,
-          state: MessageState.delivered,
-          createdAt: DateTime.now(),
-          updatedAt: DateTime.now(),
-        ),
-      );
+          messageType: 'MESSAGE_PAYLOAD',
+          encryptedPayloadBase64: encryptedPayloadBase64,
+          senderKeyPair: masterKeyPair,
+        );
 
-      if (currentMsg.state != MessageState.receiptReceived) {
-        final tRetry = DateTime.now().millisecondsSinceEpoch;
-        debugPrint('OMNILINK_DART: [t=$tRetry] No receipt in 5s for $messageId. Executing SINGLE RETRY via MeshRouter...');
-        final router = ref.read(meshRouterProvider);
-        final retrySuccess = await router.broadcastEnvelope(envelope, targetPeerId: widget.peerId);
+        // Store encrypted envelope in persistent SQLite Outbox
+        await outboxRepo.saveToOutbox(envelope);
 
-        if (!retrySuccess) {
-          await messageRepo.updateMessageState(messageId, MessageState.failed);
-          if (mounted) {
-            ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Delivery failed: Peer did not acknowledge receipt.')),
-            );
-          }
-        }
+        // Trigger background Anti-Entropy Summary Vector Exchange across active radio links
+        await daemon.triggerAntiEntropySync();
+      } catch (e) {
+        debugPrint('OMNILINK_UI: Exception during background outbox queueing: $e');
       }
-    });
+    }());
   }
 
   void _scrollToBottom() {

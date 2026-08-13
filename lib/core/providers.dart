@@ -240,6 +240,7 @@ final meshRouterProvider = Provider<MeshRouter>((ref) {
   final router = MeshRouter(
     transportAdapter: ref.watch(transportAdapterProvider),
     packetService: ref.watch(packetServiceProvider),
+    outboxRepo: ref.watch(outboxRepositoryProvider),
     getConnectedPeers: () => ref.read(peerListProvider),
     getMyNodeId: () => ref.read(identityProvider).nodeId,
   );
@@ -251,10 +252,8 @@ final meshRouterProvider = Provider<MeshRouter>((ref) {
 final outboxDaemonProvider = Provider<OutboxDaemon>((ref) {
   final daemon = OutboxDaemon(
     transportAdapter: ref.watch(transportAdapterProvider),
-    outboxRepo: ref.watch(outboxRepositoryProvider),
-    messageRepo: ref.watch(messageRepositoryProvider),
-    packetService: ref.watch(packetServiceProvider),
     meshRouter: ref.watch(meshRouterProvider),
+    getConnectedPeers: () => ref.read(peerListProvider),
   );
   ref.onDispose(() => daemon.dispose());
   return daemon;

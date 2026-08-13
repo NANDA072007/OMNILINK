@@ -6,15 +6,18 @@ import 'package:flutter/foundation.dart';
 import '../crypto/packet_service.dart';
 import '../models/packet_envelope.dart';
 import '../models/peer_device.dart';
+import '../repositories/outbox_repository.dart';
 import '../../transport_bridge/transport_adapter.dart';
 
-/// Global Multi-Hop Mesh Routing Engine for OMNILINK.
+/// Global Multi-Hop Epidemic Mesh Router for OMNILINK.
 ///
-/// Implements Blind Flooding relay with Time-To-Live (TTL) hop control,
-/// signature preservation, LRU loop prevention, and delivery receipt routing.
+/// Implements Delay-Tolerant Networking (DTN) via Anti-Entropy Handshakes
+/// (Summary Vector Exchanges) to eliminate radio congestion while ensuring
+/// targeted, zero-duplicate payload propagation across offline mesh nodes.
 class MeshRouter {
   final TransportAdapter _transportAdapter;
   final PacketService _packetService;
+  final OutboxRepository _outboxRepo;
   final List<PeerDevice> Function() _getConnectedPeers;
   final String? Function() _getMyNodeId;
 
@@ -25,10 +28,12 @@ class MeshRouter {
   MeshRouter({
     required TransportAdapter transportAdapter,
     required PacketService packetService,
+    required OutboxRepository outboxRepo,
     required List<PeerDevice> Function() getConnectedPeers,
     required String? Function() getMyNodeId,
   })  : _transportAdapter = transportAdapter,
         _packetService = packetService,
+        _outboxRepo = outboxRepo,
         _getConnectedPeers = getConnectedPeers,
         _getMyNodeId = getMyNodeId {
     _incomingSubscription =
@@ -51,12 +56,12 @@ class MeshRouter {
       final envelope = PacketEnvelope.fromJson(jsonString);
 
       debugPrint(
-        'OMNILINK_ROUTER: [t=$tRecv] envelope packetId=${envelope.packetId} type=${envelope.messageType} sender=${envelope.senderId.substring(0, 8)}... recipient=${envelope.recipientId.substring(0, 8)}... ttl=${envelope.ttl} hops=${envelope.hopCount}',
+        'OMNILINK_ROUTER: [t=$tRecv] envelope packetId=${envelope.packetId} type=${envelope.messageType} sender=${envelope.senderId.substring(0, 8)}... recipient=${envelope.recipientId.substring(0, 8)}...',
       );
 
-      // 1. Check LRU deduplication cache (Rule #4: Prevent infinite routing loops)
+      // 1. Check LRU deduplication cache (Rule #5: Prevent infinite routing loops)
       if (_packetService.isDuplicate(envelope.packetId)) {
-        debugPrint('OMNILINK_ROUTER: [t=$tRecv] DROPPING duplicate packet ${envelope.packetId}');
+        debugPrint('OMNILINK_EPIDEMIC: [t=$tRecv] DROPPING duplicate packet ${envelope.packetId}');
         return;
       }
       _packetService.markProcessed(envelope.packetId);
@@ -82,7 +87,16 @@ class MeshRouter {
         return;
       }
 
-      // 4. Inbound Routing Logic (Fix #2)
+      // 4. Anti-Entropy Epidemic Handshake Engine (Steps #2, #3, #4)
+      if (envelope.messageType == 'SYNC_HANDSHAKE') {
+        await _handleSyncHandshake(envelope, event.senderPeerId);
+        return;
+      } else if (envelope.messageType == 'SYNC_REQUEST') {
+        await _handleSyncRequest(envelope, event.senderPeerId);
+        return;
+      }
+
+      // 5. Inbound Routing Branch
       final isForMe = myNodeId != null &&
           (envelope.recipientId == myNodeId ||
               myNodeId.startsWith(envelope.recipientId) ||
@@ -95,31 +109,16 @@ class MeshRouter {
         );
         _localInboundController.add(envelope);
       } else if (envelope.ttl > 1) {
-        // Destination is another node -> Multi-hop Blind Flooding Relay
+        // Destination is another node -> Store in local outbox for Epidemic DTN forwarding!
         final forwardEnvelope = envelope.copyWith(
           ttl: envelope.ttl - 1,
           hopCount: envelope.hopCount + 1,
         );
 
         debugPrint(
-          'OMNILINK_ROUTER: [t=$tRecv] RELAYING transit packet ${envelope.packetId} '
-          '(target: ${envelope.recipientId.substring(0, 8)}..., new_ttl: ${forwardEnvelope.ttl}, hops: ${forwardEnvelope.hopCount})',
+          'OMNILINK_EPIDEMIC: [t=$tRecv] Storing transit packet ${envelope.packetId} in local outbox queue for future DTN relay (target: ${envelope.recipientId.substring(0, 8)}..., ttl: ${forwardEnvelope.ttl})',
         );
-
-        final jsonPayload = forwardEnvelope.toJson();
-        final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
-
-        final connectedPeers = _getConnectedPeers();
-        int relayCount = 0;
-        for (final peer in connectedPeers) {
-          // Do not send back to the ingress peer who delivered it to us
-          if (peer.peerId != event.senderPeerId &&
-              peer.connectionStatus == PeerConnectionStatus.connected) {
-            final sent = await _transportAdapter.sendPacket(peer.peerId, packetBytes);
-            if (sent) relayCount++;
-          }
-        }
-        debugPrint('OMNILINK_ROUTER: [t=$tRecv] Relayed packet ${envelope.packetId} across $relayCount peer link(s)');
+        await _outboxRepo.saveToOutbox(forwardEnvelope);
       } else {
         debugPrint('OMNILINK_ROUTER: [t=$tRecv] DROPPED packet ${envelope.packetId}: TTL exhausted (ttl=${envelope.ttl})');
       }
@@ -128,9 +127,109 @@ class MeshRouter {
     }
   }
 
-  /// Outbound Blind Flooding broadcast helper (Fix #3).
-  Future<bool> broadcastEnvelope(PacketEnvelope envelope, {String? targetPeerId}) async {
+  /// Initiates an Anti-Entropy Summary Vector Exchange with a newly connected peer endpoint.
+  Future<void> sendSyncHandshake(String peerId) async {
     final t0 = DateTime.now().millisecondsSinceEpoch;
+    final myNodeId = _getMyNodeId();
+    if (myNodeId == null) return;
+
+    try {
+      final knownIdsSet = await _outboxRepo.getAllKnownPacketIds();
+      final summaryVectorJson = jsonEncode({'known_ids': knownIdsSet.toList()});
+
+      final envelope = PacketEnvelope(
+        packetId: 'sync_hs_$t0',
+        senderId: myNodeId,
+        recipientId: peerId,
+        createdAt: t0,
+        expiresAt: t0 + 60000,
+        messageType: 'SYNC_HANDSHAKE',
+        payloadHash: 'sync_hs',
+        signature: 'sync_hs',
+        encryptedPayload: summaryVectorJson,
+      );
+
+      final jsonPayload = envelope.toJson();
+      final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
+      await _transportAdapter.sendPacket(peerId, packetBytes);
+      debugPrint('OMNILINK_EPIDEMIC: [t=$t0] Sent SYNC_HANDSHAKE to $peerId (Summary Vector size: ${knownIdsSet.length} known IDs)');
+    } catch (e) {
+      debugPrint('OMNILINK_EPIDEMIC: Failed to send SYNC_HANDSHAKE to $peerId: $e');
+    }
+  }
+
+  /// Handles incoming SYNC_HANDSHAKE by comparing Summary Vectors and requesting missing packets.
+  Future<void> _handleSyncHandshake(PacketEnvelope envelope, String senderPeerId) async {
+    final t0 = DateTime.now().millisecondsSinceEpoch;
+    final myNodeId = _getMyNodeId();
+    if (myNodeId == null) return;
+
+    try {
+      final summaryMap = jsonDecode(envelope.encryptedPayload) as Map<String, dynamic>;
+      final remoteKnownIds = Set<String>.from(summaryMap['known_ids'] as List? ?? []);
+
+      final localKnownIds = await _outboxRepo.getAllKnownPacketIds();
+
+      // Find packets that the remote peer possesses but this local node is MISSING
+      final missingForMe = remoteKnownIds.difference(localKnownIds);
+
+      debugPrint(
+        'OMNILINK_EPIDEMIC: [t=$t0] Evaluated SYNC_HANDSHAKE from ${envelope.senderId}: '
+        'Remote has ${remoteKnownIds.length} IDs, Local has ${localKnownIds.length} IDs. Missing for me: ${missingForMe.length}',
+      );
+
+      if (missingForMe.isNotEmpty) {
+        final requestPayloadJson = jsonEncode({'requested_ids': missingForMe.toList()});
+
+        final reqEnvelope = PacketEnvelope(
+          packetId: 'sync_req_$t0',
+          senderId: myNodeId,
+          recipientId: envelope.senderId,
+          createdAt: t0,
+          expiresAt: t0 + 60000,
+          messageType: 'SYNC_REQUEST',
+          payloadHash: 'sync_req',
+          signature: 'sync_req',
+          encryptedPayload: requestPayloadJson,
+        );
+
+        final jsonPayload = reqEnvelope.toJson();
+        final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
+        await _transportAdapter.sendPacket(senderPeerId, packetBytes);
+        debugPrint('OMNILINK_EPIDEMIC: [t=$t0] Sent SYNC_REQUEST for ${missingForMe.length} missing packet(s) to $senderPeerId');
+      }
+    } catch (e) {
+      debugPrint('OMNILINK_EPIDEMIC: Error handling SYNC_HANDSHAKE: $e');
+    }
+  }
+
+  /// Handles incoming SYNC_REQUEST by transmitting requested target payloads.
+  Future<void> _handleSyncRequest(PacketEnvelope envelope, String senderPeerId) async {
+    final t0 = DateTime.now().millisecondsSinceEpoch;
+    try {
+      final reqMap = jsonDecode(envelope.encryptedPayload) as Map<String, dynamic>;
+      final requestedIds = List<String>.from(reqMap['requested_ids'] as List? ?? []);
+
+      debugPrint('OMNILINK_EPIDEMIC: [t=$t0] Received SYNC_REQUEST from $senderPeerId for ${requestedIds.length} packet(s)');
+
+      for (final requestedId in requestedIds) {
+        final targetEnvelope = await _outboxRepo.getEnvelopeByPacketId(requestedId);
+        if (targetEnvelope != null) {
+          final jsonPayload = targetEnvelope.toJson();
+          final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
+          final sent = await _transportAdapter.sendPacket(senderPeerId, packetBytes);
+          if (sent) {
+            debugPrint('OMNILINK_EPIDEMIC: [t=$t0] Transmitted targeted payload $requestedId to $senderPeerId');
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('OMNILINK_EPIDEMIC: Error handling SYNC_REQUEST: $e');
+    }
+  }
+
+  /// Outbound Targeted Broadcast Helper.
+  Future<bool> broadcastEnvelope(PacketEnvelope envelope, {String? targetPeerId}) async {
     final jsonPayload = envelope.toJson();
     final packetBytes = Uint8List.fromList(utf8.encode(jsonPayload));
 
@@ -139,25 +238,9 @@ class MeshRouter {
         .toList();
 
     if (connectedPeers.isEmpty) {
-      debugPrint('OMNILINK_ROUTER: [t=$t0] No connected peers active for outbound broadcast.');
       return false;
     }
 
-    // 1. Direct Link Match
-    final directPeerIndex = connectedPeers.indexWhere(
-      (p) => p.peerId == targetPeerId || p.nodeId == envelope.recipientId || p.peerId == envelope.recipientId,
-    );
-
-    if (directPeerIndex != -1) {
-      final target = connectedPeers[directPeerIndex];
-      debugPrint('OMNILINK_ROUTER: [t=$t0] Direct link match for target ${target.peerId}. Transmitting directly...');
-      return await _transportAdapter.sendPacket(target.peerId, packetBytes);
-    }
-
-    // 2. Blind Flooding Multi-Hop Broadcast
-    debugPrint(
-      'OMNILINK_ROUTER: [t=$t0] Recipient ${envelope.recipientId.substring(0, 8)}... not directly linked. Blind Flooding packet ${envelope.packetId} across ${connectedPeers.length} peer(s)...',
-    );
     var sentAny = false;
     for (final peer in connectedPeers) {
       final success = await _transportAdapter.sendPacket(peer.peerId, packetBytes);
