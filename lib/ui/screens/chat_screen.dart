@@ -10,7 +10,6 @@ import 'package:uuid/uuid.dart';
 import '../../core/models/message.dart';
 import '../../core/models/packet_envelope.dart';
 import '../../core/providers.dart';
-import '../../transport_bridge/transport_adapter.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String peerId;
@@ -30,46 +29,37 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final Uuid _uuid = const Uuid();
-  StreamSubscription<IncomingPacketEvent>? _packetSubscription;
+  StreamSubscription<PacketEnvelope>? _envelopeSubscription;
 
   @override
   void initState() {
     super.initState();
-    _subscribeToIncomingPackets();
+    _subscribeToIncomingEnvelopes();
   }
 
   @override
   void dispose() {
-    _packetSubscription?.cancel();
+    _envelopeSubscription?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
-  void _subscribeToIncomingPackets() {
-    final adapter = ref.read(transportAdapterProvider);
-    _packetSubscription = adapter.incomingPackets.listen(_handleIncomingPacket);
+  /// Listens to local inbound stream from the global MeshRouter.
+  void _subscribeToIncomingEnvelopes() {
+    final router = ref.read(meshRouterProvider);
+    _envelopeSubscription = router.localInboundStream.listen(_handleIncomingEnvelope);
   }
 
-  /// Handles incoming raw byte packet from native transport layer.
-  Future<void> _handleIncomingPacket(IncomingPacketEvent event) async {
-    // Only process packets received from this peer
-    if (event.senderPeerId != widget.peerId) return;
+  /// Processes pre-validated incoming envelopes routed specifically to this local device.
+  Future<void> _handleIncomingEnvelope(PacketEnvelope envelope) async {
+    // Filter packets by sender ID to match this conversation thread
+    final isMatchingPeer = envelope.senderId == widget.peerId ||
+        envelope.senderId.startsWith(widget.peerId);
+    if (!isMatchingPeer) return;
 
     try {
-      final jsonString = utf8.decode(event.payloadBytes);
-      final envelope = PacketEnvelope.fromJson(jsonString);
-
-      final packetService = ref.read(packetServiceProvider);
       final cryptoService = ref.read(cryptoServiceProvider);
-
-      // Check deduplication
-      if (packetService.isDuplicate(envelope.packetId)) return;
-      packetService.markProcessed(envelope.packetId);
-
-      // Validate envelope structure & Ed25519 signature
-      final isValid = await packetService.validateEnvelope(envelope);
-      if (!isValid) return;
 
       if (envelope.messageType == 'MESSAGE_PAYLOAD') {
         // Derive symmetric key for payload decryption
@@ -102,14 +92,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         final messageRepo = ref.read(messageRepositoryProvider);
         await messageRepo.saveMessage(receivedMessage);
 
-        // 2. Trigger reactive update for this conversation
+        // 2. Trigger reactive update for this conversation thread
         if (mounted) {
           ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
           _scrollToBottom();
         }
       }
     } catch (e) {
-      // Packet validation or decryption failed cleanly
+      // Decryption failed cleanly
     }
   }
 
@@ -276,7 +266,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                         ),
                         const SizedBox(height: 4),
                         const Text(
-                          'ChaCha20-Poly1305 • Ed25519 Signatures • Direct Radio Link',
+                          'ChaCha20-Poly1305 • Ed25519 Signatures • Mesh Relay Router',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],

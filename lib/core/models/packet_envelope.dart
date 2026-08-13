@@ -90,6 +90,40 @@ class PacketEnvelope {
   factory PacketEnvelope.fromJson(String source) =>
       PacketEnvelope.fromMap(jsonDecode(source) as Map<String, dynamic>);
 
+  PacketEnvelope copyWith({
+    String? protocolVersion,
+    String? packetId,
+    String? senderId,
+    String? recipientId,
+    int? createdAt,
+    int? expiresAt,
+    int? ttl,
+    int? hopCount,
+    int? maxHops,
+    int? priority,
+    String? messageType,
+    String? payloadHash,
+    String? signature,
+    String? encryptedPayload,
+  }) {
+    return PacketEnvelope(
+      protocolVersion: protocolVersion ?? this.protocolVersion,
+      packetId: packetId ?? this.packetId,
+      senderId: senderId ?? this.senderId,
+      recipientId: recipientId ?? this.recipientId,
+      createdAt: createdAt ?? this.createdAt,
+      expiresAt: expiresAt ?? this.expiresAt,
+      ttl: ttl ?? this.ttl,
+      hopCount: hopCount ?? this.hopCount,
+      maxHops: maxHops ?? this.maxHops,
+      priority: priority ?? this.priority,
+      messageType: messageType ?? this.messageType,
+      payloadHash: payloadHash ?? this.payloadHash,
+      signature: signature ?? this.signature,
+      encryptedPayload: encryptedPayload ?? this.encryptedPayload,
+    );
+  }
+
   /// Computes total size in bytes of serialized JSON envelope.
   int get sizeInBytes => utf8.encode(toJson()).length;
 

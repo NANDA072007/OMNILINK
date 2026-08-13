@@ -13,6 +13,7 @@ import 'models/peer_device.dart';
 import 'repositories/message_repository.dart';
 import 'repositories/outbox_repository.dart';
 import 'repositories/peer_repository.dart';
+import 'routing/mesh_router.dart';
 
 // 1. Core Services & Database
 final cryptoServiceProvider = Provider<CryptoService>((ref) => CryptoService());
@@ -231,4 +232,16 @@ final conversationMessagesProvider = StateNotifierProvider.family<
     conversationId,
     ref.watch(messageRepositoryProvider),
   );
+});
+
+// 6. Global Multi-Hop Mesh Router
+final meshRouterProvider = Provider<MeshRouter>((ref) {
+  final router = MeshRouter(
+    transportAdapter: ref.watch(transportAdapterProvider),
+    packetService: ref.watch(packetServiceProvider),
+    getConnectedPeers: () => ref.read(peerListProvider),
+    getMyNodeId: () => ref.read(identityProvider).nodeId,
+  );
+  ref.onDispose(() => router.dispose());
+  return router;
 });
