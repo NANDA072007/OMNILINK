@@ -5,6 +5,7 @@ import '../../core/models/peer_device.dart';
 import '../../core/providers.dart';
 import 'chat_screen.dart';
 import 'discovery_screen.dart';
+import 'trusted_devices_screen.dart';
 
 /// Contacts & Conversations Screen allowing offline and multi-hop messaging.
 ///
@@ -84,6 +85,16 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
           ],
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.bluetooth_connected_rounded, color: Color(0xFF00E676)),
+            tooltip: 'Trusted Paired Devices',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const TrustedDevicesScreen()),
+              ).then((_) => _loadContactsFromDb());
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.radar_rounded, color: Color(0xFF00E676)),
             tooltip: 'Radar Discovery Scanner',

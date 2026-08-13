@@ -252,6 +252,13 @@ class AndroidTransportAdapter implements TransportAdapter {
     debugPrint(
       'OMNILINK_DART: sendPacket called to $peerId with ${packetBytes.length} bytes',
     );
+    // 1. Check if peerId is a Bluetooth MAC address (e.g. 00:11:22:33:44:55)
+    final isMacAddress = RegExp(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$').hasMatch(peerId);
+    if (isMacAddress) {
+      return await sendRfcommPacket(peerId, packetBytes);
+    }
+
+    // 2. High-speed Nearby Connections transport
     try {
       final result = await _controlChannel.invokeMethod<bool>(
         'sendPacket',
@@ -260,15 +267,83 @@ class AndroidTransportAdapter implements TransportAdapter {
           'payload': packetBytes,
         },
       );
-      return result ?? false;
-    } on MissingPluginException catch (e) {
-      _handleNativeError('MissingPluginException: ${e.message}');
-      return false;
-    } on PlatformException catch (e) {
-      _handleNativeError('PlatformException: ${e.message}');
-      return false;
+      if (result == true) return true;
+    } catch (_) {}
+
+    // 3. Fallback to RFCOMM transmit
+    return await sendRfcommPacket(peerId, packetBytes);
+  }
+
+  /// Lists bonded system Bluetooth devices.
+  Future<List<Map<String, dynamic>>> getBondedBluetoothDevices() async {
+    try {
+      final rawList = await _controlChannel.invokeListMethod<dynamic>('getBondedBluetoothDevices');
+      if (rawList == null) return [];
+      return rawList.map((e) => Map<String, dynamic>.from(e as Map)).toList();
     } catch (e) {
-      _handleNativeError(e.toString());
+      debugPrint('OMNILINK_DART: Error fetching bonded devices: $e');
+      return [];
+    }
+  }
+
+  /// Starts RFCOMM background server socket listener.
+  Future<bool> startRfcommServer() async {
+    try {
+      final result = await _controlChannel.invokeMethod<bool>('startRfcommServer');
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Stops RFCOMM background server socket listener.
+  Future<bool> stopRfcommServer() async {
+    try {
+      final result = await _controlChannel.invokeMethod<bool>('stopRfcommServer');
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Connects to a bonded Bluetooth device using RFCOMM socket stream.
+  Future<bool> connectRfcommDevice(String deviceAddress) async {
+    try {
+      final result = await _controlChannel.invokeMethod<bool>(
+        'connectRfcommDevice',
+        {'deviceAddress': deviceAddress},
+      );
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Disconnects an active RFCOMM socket stream.
+  Future<bool> disconnectRfcommDevice(String deviceAddress) async {
+    try {
+      final result = await _controlChannel.invokeMethod<bool>(
+        'disconnectRfcommDevice',
+        {'deviceAddress': deviceAddress},
+      );
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Transmits raw packet bytes over RFCOMM stream socket.
+  Future<bool> sendRfcommPacket(String deviceAddress, Uint8List payload) async {
+    try {
+      final result = await _controlChannel.invokeMethod<bool>(
+        'sendRfcommPacket',
+        {
+          'deviceAddress': deviceAddress,
+          'payload': payload,
+        },
+      );
+      return result ?? false;
+    } catch (e) {
       return false;
     }
   }

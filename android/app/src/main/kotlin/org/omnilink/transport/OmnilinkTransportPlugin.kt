@@ -167,6 +167,52 @@ class OmnilinkTransportPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
                     result.success(false)
                 }
             }
+            "getBondedBluetoothDevices" -> {
+                val rfcomm = context?.let { BluetoothRfcommTransport.getInstance(it) }
+                val devices = rfcomm?.getBondedDevices() ?: emptyList()
+                result.success(devices)
+            }
+            "startRfcommServer" -> {
+                val rfcomm = context?.let { BluetoothRfcommTransport.getInstance(it) }
+                val success = rfcomm?.startServer() ?: false
+                result.success(success)
+            }
+            "stopRfcommServer" -> {
+                val rfcomm = context?.let { BluetoothRfcommTransport.getInstance(it) }
+                rfcomm?.stopServer()
+                result.success(true)
+            }
+            "connectRfcommDevice" -> {
+                val deviceAddress = call.argument<String>("deviceAddress")
+                if (deviceAddress == null) {
+                    result.error("INVALID_ARGUMENT", "deviceAddress is required", null)
+                    return
+                }
+                val rfcomm = context?.let { BluetoothRfcommTransport.getInstance(it) }
+                val success = rfcomm?.connectDevice(deviceAddress) ?: false
+                result.success(success)
+            }
+            "disconnectRfcommDevice" -> {
+                val deviceAddress = call.argument<String>("deviceAddress")
+                if (deviceAddress == null) {
+                    result.error("INVALID_ARGUMENT", "deviceAddress is required", null)
+                    return
+                }
+                val rfcomm = context?.let { BluetoothRfcommTransport.getInstance(it) }
+                val success = rfcomm?.disconnectDevice(deviceAddress) ?: false
+                result.success(success)
+            }
+            "sendRfcommPacket" -> {
+                val deviceAddress = call.argument<String>("deviceAddress")
+                val payload = extractByteArray(call.argument<Any>("payload"))
+                if (deviceAddress == null || payload == null) {
+                    result.error("INVALID_ARGUMENT", "deviceAddress and payload are required", null)
+                    return
+                }
+                val rfcomm = context?.let { BluetoothRfcommTransport.getInstance(it) }
+                val success = rfcomm?.sendPacket(deviceAddress, payload) ?: false
+                result.success(success)
+            }
             else -> {
                 result.notImplemented()
             }
