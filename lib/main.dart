@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'ui/screens/discovery_screen.dart';
+import 'ui/screens/contacts_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -48,7 +48,7 @@ class OmnilinkApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const DiscoveryScreen(),
+      home: const ContactsScreen(),
     );
   }
 }

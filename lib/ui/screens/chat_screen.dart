@@ -310,17 +310,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       case MessageState.draft:
       case MessageState.encrypted:
       case MessageState.searchingForPeer:
-        return const Text('⏳', style: TextStyle(fontSize: 12));
+        return const Text('⏳ Searching', style: TextStyle(fontSize: 11, color: Colors.orangeAccent));
       case MessageState.queued:
-        return const Text('⏳ Queued for delivery', style: TextStyle(fontSize: 11, color: Colors.orangeAccent));
+        return const Text('⏳ Waiting for mesh route...', style: TextStyle(fontSize: 11, color: Colors.amber));
       case MessageState.sending:
-        return const Text('✓', style: TextStyle(fontSize: 12, color: Colors.grey));
+        return const Text('✓ Transmitting...', style: TextStyle(fontSize: 11, color: Colors.grey));
       case MessageState.delivered:
-        return const Text('✓✓', style: TextStyle(fontSize: 12, color: Colors.grey));
+        return const Text('✓✓ Delivered', style: TextStyle(fontSize: 11, color: Colors.white70));
       case MessageState.receiptReceived:
-        return const Text('✓✓', style: TextStyle(fontSize: 12, color: Color(0xFF00E676)));
+        return const Text('✓✓ Acknowledged', style: TextStyle(fontSize: 11, color: Color(0xFF00E676)));
       case MessageState.failed:
-        return const Text('❌', style: TextStyle(fontSize: 12, color: Colors.red));
+        return const Text('❌ Failed', style: TextStyle(fontSize: 11, color: Colors.redAccent));
       default:
         return const SizedBox.shrink();
     }
