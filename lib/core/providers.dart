@@ -202,6 +202,24 @@ class PeerListNotifier extends StateNotifier<List<PeerDevice>> {
     }
   }
 
+  /// Associates a transient peerId with a cryptographic nodeId.
+  void updatePeerNodeId(String peerId, String nodeId, {String? friendlyName}) {
+    state = [
+      for (final p in state)
+        if (p.peerId == peerId || p.nodeId == nodeId)
+          p.copyWith(
+            nodeId: nodeId,
+            friendlyName: (friendlyName != null && friendlyName.isNotEmpty) ? friendlyName : p.friendlyName,
+          )
+        else
+          p
+    ];
+    final idx = state.indexWhere((p) => p.peerId == peerId || p.nodeId == nodeId);
+    if (idx != -1) {
+      _peerRepository.savePeer(state[idx]);
+    }
+  }
+
   @override
   void dispose() {
     _subscription.cancel();
@@ -275,6 +293,9 @@ final routerEngineProvider = Provider<RouterEngine>((ref) {
     getMyNodeId: () => ref.read(identityProvider).nodeId ?? '',
     getConnectedPeers: () => ref.read(peerListProvider),
   );
+  engine.onPeerNodeIdDiscovered = (peerId, nodeId) {
+    ref.read(peerListProvider.notifier).updatePeerNodeId(peerId, nodeId);
+  };
   ref.onDispose(() => engine.dispose());
   return engine;
 });

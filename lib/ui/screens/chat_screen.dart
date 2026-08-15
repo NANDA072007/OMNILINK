@@ -9,6 +9,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../core/models/message.dart';
 import '../../core/models/packet_envelope.dart';
+import '../../core/models/peer_device.dart';
 import '../../core/providers.dart';
 import '../../transport_bridge/android_transport_adapter.dart';
 
@@ -184,6 +185,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final messageId = _uuid.v4();
     final messageRepo = ref.read(messageRepositoryProvider);
 
+    final connectedPeers = ref.read(peerListProvider)
+        .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
+        .toList();
+
+    final isDirectlyConnected = connectedPeers.any(
+      (p) => p.nodeId == widget.peerId || p.peerId == widget.peerId,
+    );
+
+    final initialState = isDirectlyConnected ? MessageState.sending : MessageState.queued;
+
+    debugPrint('OMNILINK_SEND: User tapped send for ${widget.peerId}');
+
     // 1. INSTANT LOCAL SAVE & UI REFRESH (< 20ms execution)
     final draftMessage = Message(
       messageId: messageId,
@@ -191,7 +204,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       senderNodeId: myNodeId,
       recipientNodeId: widget.peerId,
       plaintextBody: text,
-      state: MessageState.queued,
+      state: initialState,
       createdAt: DateTime.now(),
       updatedAt: DateTime.now(),
     );

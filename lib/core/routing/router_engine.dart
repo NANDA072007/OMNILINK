@@ -15,6 +15,7 @@ import 'outbox_daemon.dart';
 import 'prophet_engine.dart';
 import 'route_protocol.dart';
 import 'routing_database.dart';
+import 'send_queue.dart';
 
 enum RouteStrategy {
   direct,
@@ -67,6 +68,11 @@ class RouterEngine {
   late final ProphetEngine prophetEngine;
   late final RouteProtocol routeProtocol;
   late final OutboxDaemon outboxDaemon;
+  late final SendQueueManager sendQueueManager;
+
+  final Map<String, String> _peerIdToNodeId = {};
+  final Map<String, String> _nodeIdToPeerId = {};
+  void Function(String peerId, String nodeId)? onPeerNodeIdDiscovered;
 
   final _localInboundController = StreamController<PacketEnvelope>.broadcast();
   final _routingEventsController = StreamController<RoutingEvent>.broadcast();
@@ -101,6 +107,7 @@ class RouterEngine {
       messageRepo: MessageRepository(dbService: DatabaseService.instance),
       getConnectedPeers: getConnectedPeers,
     );
+    sendQueueManager = SendQueueManager(transport: transport);
     _init();
   }
 
@@ -116,6 +123,20 @@ class RouterEngine {
 
   Stream<PacketEnvelope> get localInboundStream => _localInboundController.stream;
   Stream<RoutingEvent> get routingEvents => _routingEventsController.stream;
+
+  void registerPeerNodeId(String peerId, String nodeId) {
+    if (nodeId.isEmpty || peerId.isEmpty) return;
+    final isNew = _peerIdToNodeId[peerId] != nodeId;
+    _peerIdToNodeId[peerId] = nodeId;
+    _nodeIdToPeerId[nodeId] = peerId;
+
+    if (isNew) {
+      final shortNodeId = nodeId.length > 8 ? nodeId.substring(0, 8) : nodeId;
+      debugPrint('OMNILINK_ROUTER: Registered registry mapping peerId $peerId <-> nodeId $shortNodeId...');
+      onPeerNodeIdDiscovered?.call(peerId, nodeId);
+      unawaited(outboxDaemon.onIdentityLearned(nodeId, peerId));
+    }
+  }
 
   void _emitEvent(String type, String packetId, String strategy, {String? peerId}) {
     _routingEventsController.add(
@@ -147,6 +168,9 @@ class RouterEngine {
 
       // Mark processed
       packetService.markProcessed(envelope.packetId);
+
+      // TASK 1: Register peerId <-> nodeId mapping in registry & flush outbox
+      registerPeerNodeId(event.senderPeerId, envelope.senderId);
 
       // Record encounter with sender and update PRoPHET probabilities
       await prophetEngine.recordEncounter(envelope.senderId, event.senderPeerId);
@@ -256,9 +280,12 @@ class RouterEngine {
         .where((p) => p.peerId != ingressPeerId)
         .toList();
 
-    // Layer 1: Direct Link
+    // Layer 1: Direct Link Check (Peer ID <-> Node ID mapped)
+    final mappedPeerId = _nodeIdToPeerId[envelope.recipientId];
     final directPeer = connectedPeers.firstWhere(
-      (p) => p.peerId == envelope.recipientId || p.nodeId == envelope.recipientId,
+      (p) => p.peerId == envelope.recipientId ||
+             p.nodeId == envelope.recipientId ||
+             p.peerId == mappedPeerId,
       orElse: () => PeerDevice(
         peerId: '',
         friendlyName: '',
@@ -268,12 +295,15 @@ class RouterEngine {
       ),
     );
     if (directPeer.peerId.isNotEmpty) {
+      debugPrint('OMNILINK_ROUTER: Decision for ${envelope.recipientId} -> Direct connection found via peerId ${directPeer.peerId}');
       return RouteDecision(
         strategy: RouteStrategy.direct,
         peerId: directPeer.peerId,
         reason: 'Recipient is directly connected radio link',
       );
     }
+
+    debugPrint('OMNILINK_ROUTER: Decision for ${envelope.recipientId} -> No direct connection. Routing to Outbox.');
 
     // Layer 2: Distance Vector Routing Table
     final route = await db.getTopProbableRelay(envelope.recipientId);
@@ -333,6 +363,11 @@ class RouterEngine {
   // ===========================================================================
 
   Future<void> sendMessage(PacketEnvelope envelope) async {
+    final connectedPeers = getConnectedPeers()
+        .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
+        .toList();
+    debugPrint('OMNILINK_ROUTER: Checking active connections... found ${connectedPeers.length} peers.');
+
     final decision = await _selectNextHop(envelope);
 
     if (decision.strategy != RouteStrategy.storeAndForward) {
@@ -340,10 +375,19 @@ class RouterEngine {
       bool anySent = false;
 
       if (decision.peerId != null) {
-        anySent = await transport.sendPacket(decision.peerId!, payloadBytes);
+        debugPrint('OMNILINK_ROUTER: Match found. Handing to SendQueue for peerId ${decision.peerId}.');
+        anySent = await sendQueueManager.enqueueAndSend(
+          packetId: envelope.packetId,
+          peerId: decision.peerId!,
+          payloadBytes: payloadBytes,
+        );
       } else if (decision.peerIds != null) {
         for (final peerId in decision.peerIds!) {
-          final sent = await transport.sendPacket(peerId, payloadBytes);
+          final sent = await sendQueueManager.enqueueAndSend(
+            packetId: envelope.packetId,
+            peerId: peerId,
+            payloadBytes: payloadBytes,
+          );
           if (sent) anySent = true;
         }
       }

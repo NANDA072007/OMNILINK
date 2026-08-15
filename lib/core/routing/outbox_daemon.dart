@@ -77,6 +77,24 @@ class OutboxDaemon {
     }
   }
 
+  /// TASK 3: Force immediate outbox flush when learning or confirming a peer's cryptographic nodeId.
+  Future<void> onIdentityLearned(String nodeId, String peerId) async {
+    try {
+      final pendingPackets = await db.getPendingOutboxPackets();
+      final matchingPackets = pendingPackets.where((packet) {
+        return packet.recipientNodeId == nodeId || packet.recipientNodeId == peerId;
+      }).toList();
+
+      debugPrint('OMNILINK_OUTBOX: Identity learned for $nodeId (peerId=$peerId). Flushing ${matchingPackets.length} pending packets immediately.');
+
+      if (matchingPackets.isNotEmpty) {
+        await onPeerConnected(peerId);
+      }
+    } catch (e) {
+      debugPrint('OMNILINK_OUTBOX: Error in onIdentityLearned: $e');
+    }
+  }
+
   /// Flushes matching outbox packets when a new peer connects.
   Future<void> onPeerConnected(String peerId) async {
     if (_isFlushing) return;
