@@ -126,9 +126,6 @@ class OutboxDaemon {
         } else {
           await _retryWithBackoff(packet);
         }
-
-        // 500ms pacing delay between transmissions to prevent Bluetooth radio congestion
-        await Future.delayed(const Duration(milliseconds: 500));
       }
     } catch (e) {
       debugPrint('OMNILINK_OUTBOX: Exception during outbox flush: $e');
