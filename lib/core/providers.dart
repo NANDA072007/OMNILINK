@@ -88,7 +88,7 @@ class IdentityNotifier extends StateNotifier<IdentityState> {
 
   IdentityNotifier(this._cryptoService, this._storage)
       : super(IdentityState(isLoading: true)) {
-    _initIdentity();
+    Future.microtask(() => _initIdentity());
   }
 
   Future<void> _initIdentity() async {

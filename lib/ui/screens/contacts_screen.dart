@@ -68,19 +68,26 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
           children: [
             const Icon(Icons.forum_rounded, color: Color(0xFF00E676)),
             const SizedBox(width: 10),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('OMNILINK Contacts'),
-                Text(
-                  'ID: $truncatedNodeId',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: Color(0xFF00E676),
-                    fontFamily: 'monospace',
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'OMNILINK Contacts',
+                    overflow: TextOverflow.ellipsis,
                   ),
-                ),
-              ],
+                  Text(
+                    'ID: $truncatedNodeId',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Color(0xFF00E676),
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ],
+              ),
             ),
           ],
         ),
