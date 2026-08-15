@@ -293,17 +293,31 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       case MessageState.draft:
       case MessageState.encrypted:
       case MessageState.searchingForPeer:
-        return const Text('⏳ Searching', style: TextStyle(fontSize: 11, color: Colors.orangeAccent));
+        return const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.travel_explore, size: 12, color: Colors.orangeAccent),
+            SizedBox(width: 4),
+            Text('Searching for route...', style: TextStyle(fontSize: 11, color: Colors.orangeAccent)),
+          ],
+        );
       case MessageState.queued:
-        return const Text('⏳ Waiting for mesh route...', style: TextStyle(fontSize: 11, color: Colors.amber));
+        return const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.schedule, size: 12, color: Colors.amber),
+            SizedBox(width: 4),
+            Text('Queued in outbox...', style: TextStyle(fontSize: 11, color: Colors.amber)),
+          ],
+        );
       case MessageState.sending:
         return const Text('✓ Transmitting...', style: TextStyle(fontSize: 11, color: Colors.grey));
       case MessageState.delivered:
-        return const Text('✓✓ Delivered', style: TextStyle(fontSize: 11, color: Colors.white70));
+        return const Text('✓✓ Delivered to node', style: TextStyle(fontSize: 11, color: Colors.white70));
       case MessageState.receiptReceived:
-        return const Text('✓✓ Acknowledged', style: TextStyle(fontSize: 11, color: Color(0xFF00E676)));
+        return const Text('✓✓ Delivered & Acknowledged', style: TextStyle(fontSize: 11, color: Color(0xFF00E676)));
       case MessageState.failed:
-        return const Text('❌ Failed', style: TextStyle(fontSize: 11, color: Colors.redAccent));
+        return const Text('❌ Expired / Failed', style: TextStyle(fontSize: 11, color: Colors.redAccent));
       default:
         return const SizedBox.shrink();
     }

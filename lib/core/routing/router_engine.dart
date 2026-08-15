@@ -5,11 +5,13 @@ import 'package:flutter/foundation.dart';
 import '../../transport_bridge/transport_adapter.dart';
 import '../crypto/crypto_service.dart';
 import '../crypto/packet_service.dart';
+import '../database/database_service.dart';
 import '../models/packet_envelope.dart';
 import '../models/peer_device.dart';
+import '../repositories/message_repository.dart';
 import 'models/neighbor_info.dart';
-import 'models/queued_packet.dart';
 import 'models/route_entry.dart';
+import 'outbox_daemon.dart';
 import 'prophet_engine.dart';
 import 'route_protocol.dart';
 import 'routing_database.dart';
@@ -64,6 +66,7 @@ class RouterEngine {
   final List<PeerDevice> Function() getConnectedPeers;
   late final ProphetEngine prophetEngine;
   late final RouteProtocol routeProtocol;
+  late final OutboxDaemon outboxDaemon;
 
   final _localInboundController = StreamController<PacketEnvelope>.broadcast();
   final _routingEventsController = StreamController<RoutingEvent>.broadcast();
@@ -89,6 +92,13 @@ class RouterEngine {
       cryptoService: cryptoService,
       prophetEngine: prophetEngine,
       getMyNodeId: getMyNodeId,
+      getConnectedPeers: getConnectedPeers,
+    );
+    outboxDaemon = OutboxDaemon(
+      db: db,
+      transport: transport,
+      router: this,
+      messageRepo: MessageRepository(dbService: DatabaseService.instance),
       getConnectedPeers: getConnectedPeers,
     );
     _init();
@@ -345,19 +355,9 @@ class RouterEngine {
       }
     }
 
-    // Store-and-Forward queueing
+    // Store-and-Forward queueing via OutboxDaemon
     debugPrint('OMNILINK_ROUTER: Saving packet ${envelope.packetId} to SQLite outbox_queue');
-    await db.insertOrUpdateQueuedPacket(
-      QueuedPacket(
-        packetId: envelope.packetId,
-        senderNodeId: envelope.senderId,
-        recipientNodeId: envelope.recipientId,
-        payload: envelope.toJson(),
-        createdAt: DateTime.fromMillisecondsSinceEpoch(envelope.createdAt),
-        nextRetryAt: DateTime.now().add(const Duration(seconds: 5)),
-        status: 'pending',
-      ),
-    );
+    await outboxDaemon.enqueue(envelope);
     _emitEvent('queued', envelope.packetId, 'storeAndForward');
   }
 
@@ -410,7 +410,7 @@ class RouterEngine {
   Future<void> _handlePeerEvent(PeerConnectionEvent event) async {
     if (event.eventType == PeerConnectionEventType.onConnected) {
       await routeProtocol.sendRouteAdvertisement(event.peerId);
-      await _onPeerConnected(event.peerId);
+      await outboxDaemon.onPeerConnected(event.peerId);
     }
   }
 
@@ -484,6 +484,7 @@ class RouterEngine {
   }
 
   void dispose() {
+    outboxDaemon.dispose();
     routeProtocol.dispose();
     _packetSubscription?.cancel();
     _peerSubscription?.cancel();

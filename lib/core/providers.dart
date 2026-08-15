@@ -255,8 +255,10 @@ final meshRouterProvider = Provider<MeshRouter>((ref) {
 // 7. Store-and-Forward Outbox Daemon
 final outboxDaemonProvider = Provider<OutboxDaemon>((ref) {
   final daemon = OutboxDaemon(
-    transportAdapter: ref.watch(transportAdapterProvider),
-    meshRouter: ref.watch(meshRouterProvider),
+    db: ref.watch(routingDatabaseProvider),
+    transport: ref.watch(transportAdapterProvider),
+    router: ref.watch(routerEngineProvider),
+    messageRepo: ref.watch(messageRepositoryProvider),
     getConnectedPeers: () => ref.read(peerListProvider),
   );
   ref.onDispose(() => daemon.dispose());

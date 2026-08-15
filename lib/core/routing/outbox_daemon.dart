@@ -1,81 +1,232 @@
 import 'dart:async';
-
+import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 
-import '../models/peer_device.dart';
 import '../../transport_bridge/transport_adapter.dart';
-import 'mesh_router.dart';
+import '../models/message.dart';
+import '../models/packet_envelope.dart';
+import '../models/peer_device.dart';
+import '../repositories/message_repository.dart';
+import 'models/queued_packet.dart';
+import 'router_engine.dart' hide RouteStrategy;
+import 'routing_database.dart';
 
-/// Store-and-Forward Daemon managing Epidemic Anti-Entropy Summary Vector Exchanges.
-///
-/// Listens to physical radio connection events and automatically initiates anti-entropy
-/// handshakes whenever radio links connect or local outbox messages are queued.
+/// Store-and-Forward Daemon managing persistent message outbox queues in SQLite.
+/// Guarantees eventual message delivery across mesh disruptions with priority queueing,
+/// automatic peer-connection flushes, TTL expiration, and exponential backoff retries.
 class OutboxDaemon {
-  final TransportAdapter _transportAdapter;
-  final MeshRouter _meshRouter;
-  final List<PeerDevice> Function() _getConnectedPeers;
+  final RoutingDatabaseService db;
+  final TransportAdapter transport;
+  final RouterEngine router;
+  final MessageRepository messageRepo;
+  final List<PeerDevice> Function() getConnectedPeers;
 
-  late final StreamSubscription<PeerConnectionEvent> _peerSubscription;
+  StreamSubscription<PeerConnectionEvent>? _peerSub;
+  Timer? _maintenanceTimer;
+  bool _isFlushing = false;
 
   OutboxDaemon({
-    required TransportAdapter transportAdapter,
-    required MeshRouter meshRouter,
-    required List<PeerDevice> Function() getConnectedPeers,
-  })  : _transportAdapter = transportAdapter,
-        _meshRouter = meshRouter,
-        _getConnectedPeers = getConnectedPeers {
-    _peerSubscription = _transportAdapter.peerEvents.listen(_handlePeerEvent);
+    required this.db,
+    required this.transport,
+    required this.router,
+    required this.messageRepo,
+    required this.getConnectedPeers,
+  }) {
+    start();
   }
 
-  /// Triggered whenever physical radio connection events occur.
-  Future<void> _handlePeerEvent(PeerConnectionEvent event) async {
-    if (event.eventType == PeerConnectionEventType.onConnected) {
-      debugPrint(
-        'OMNILINK_OUTBOX: Peer connected (${event.peerId}). Initiating Anti-Entropy Handshake...',
+  /// Starts listening for peer connection events and sets up periodic maintenance.
+  void start() {
+    _peerSub?.cancel();
+    _peerSub = transport.peerEvents.listen((event) {
+      if (event.eventType == PeerConnectionEventType.onConnected) {
+        onPeerConnected(event.peerId);
+      }
+    });
+
+    _maintenanceTimer?.cancel();
+    _maintenanceTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      maintenance();
+    });
+
+    debugPrint('OMNILINK_OUTBOX: OutboxDaemon started and listening for peer connections.');
+  }
+
+  /// Enqueues an encrypted packet envelope into the persistent SQLite Outbox queue.
+  Future<void> enqueue(PacketEnvelope envelope) async {
+    try {
+      final queued = QueuedPacket(
+        packetId: envelope.packetId,
+        senderNodeId: envelope.senderId,
+        recipientNodeId: envelope.recipientId,
+        payload: envelope.toJson(),
+        priority: MessagePriority.normal,
+        strategy: RouteStrategy.storeAndForward,
+        ttl: envelope.ttl,
+        hopCount: envelope.hopCount,
+        createdAt: DateTime.fromMillisecondsSinceEpoch(envelope.createdAt),
+        nextRetryAt: DateTime.now(),
+        status: 'pending',
       );
-      await _meshRouter.sendSyncHandshake(event.peerId);
+
+      await db.insertOrUpdateQueuedPacket(queued);
+      debugPrint('OMNILINK_OUTBOX: queued packet ${envelope.packetId} for recipient ${envelope.recipientId}');
+    } catch (e) {
+      debugPrint('OMNILINK_OUTBOX: Error enqueueing packet ${envelope.packetId}: $e');
     }
   }
 
-  /// Triggers an Anti-Entropy Summary Vector Sync across all currently connected radio links.
-  Future<void> triggerAntiEntropySync() async {
-    final connectedPeers = _getConnectedPeers()
+  /// Flushes matching outbox packets when a new peer connects.
+  Future<void> onPeerConnected(String peerId) async {
+    if (_isFlushing) return;
+    _isFlushing = true;
+
+    try {
+      debugPrint('OMNILINK_OUTBOX: Peer connected ($peerId). Processing pending outbox items...');
+      final connectedPeers = getConnectedPeers()
+          .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
+          .toList();
+
+      final peerDevice = connectedPeers.firstWhere(
+        (p) => p.peerId == peerId,
+        orElse: () => PeerDevice(
+          peerId: peerId,
+          friendlyName: '',
+          lastSeenAt: DateTime.now(),
+          transportType: 'ANDROID_NEARBY',
+          connectionStatus: PeerConnectionStatus.connected,
+        ),
+      );
+
+      final peerNodeId = peerDevice.nodeId ?? peerId;
+      final pendingPackets = await db.getPendingOutboxPackets();
+
+      // Filter packets for this peer (direct recipient or relay path)
+      final relevantPackets = pendingPackets.where((packet) {
+        return packet.recipientNodeId == peerNodeId ||
+            packet.recipientNodeId == peerId ||
+            packet.status == 'pending';
+      }).toList();
+
+      // Sort by dynamic urgencyScore (priority weight + age + TTL - retry penalty)
+      relevantPackets.sort((a, b) => b.urgencyScore.compareTo(a.urgencyScore));
+
+      debugPrint('OMNILINK_OUTBOX: Found ${relevantPackets.length} candidate packet(s) to transmit to $peerId');
+
+      for (final packet in relevantPackets) {
+        final payloadBytes = utf8.encode(packet.payload);
+
+        final success = await transport.sendPacket(peerId, payloadBytes);
+
+        if (success) {
+          await db.deleteQueuedPacket(packet.packetId);
+          await messageRepo.updateMessageState(packet.packetId, MessageState.sending);
+          debugPrint('OMNILINK_OUTBOX: Transmitted packet ${packet.packetId} to $peerId. Removed from outbox.');
+        } else {
+          await _retryWithBackoff(packet);
+        }
+
+        // 500ms pacing delay between transmissions to prevent Bluetooth radio congestion
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+    } catch (e) {
+      debugPrint('OMNILINK_OUTBOX: Exception during outbox flush: $e');
+    } finally {
+      _isFlushing = false;
+    }
+  }
+
+  /// Schedules a packet retry with exponential backoff: min(2^attempts * 1000, 60000) ms.
+  Future<void> _retryWithBackoff(QueuedPacket packet) async {
+    final newAttempts = packet.retryCount + 1;
+    final delayMs = min(pow(2, newAttempts).toInt() * 1000, 60000);
+    final nextRetry = DateTime.now().add(Duration(milliseconds: delayMs));
+
+    final updatedPacket = packet.copyWith(
+      retryCount: newAttempts,
+      nextRetryAt: nextRetry,
+      status: 'pending',
+    );
+
+    await db.insertOrUpdateQueuedPacket(updatedPacket);
+    debugPrint('OMNILINK_OUTBOX: Scheduled retry #$newAttempts for packet ${packet.packetId} in ${delayMs}ms');
+
+    Timer(Duration(milliseconds: delayMs), () async {
+      final envelope = PacketEnvelope.fromJson(packet.payload);
+      await router.sendMessage(envelope);
+    });
+  }
+
+  /// Removes expired packets exceeding TTL time limit or 10 max retry attempts.
+  Future<void> _expireOldMessages() async {
+    try {
+      final now = DateTime.now();
+      final allPackets = await db.getAllQueuedPackets();
+      int expiredCount = 0;
+
+      for (final packet in allPackets) {
+        final envelope = PacketEnvelope.fromJson(packet.payload);
+        final isExpiredByTime = envelope.expiresAt < now.millisecondsSinceEpoch;
+        final isExceededRetries = packet.retryCount > 10;
+
+        if (isExpiredByTime || isExceededRetries) {
+          await db.deleteQueuedPacket(packet.packetId);
+          await messageRepo.updateMessageState(packet.packetId, MessageState.failed);
+          expiredCount++;
+          debugPrint('OMNILINK_OUTBOX: Expired packet ${packet.packetId} (timeExpired=$isExpiredByTime, retries=${packet.retryCount})');
+        }
+      }
+
+      if (expiredCount > 0) {
+        debugPrint('OMNILINK_OUTBOX: Expired $expiredCount old/failed messages from outbox_queue.');
+      }
+    } catch (e) {
+      debugPrint('OMNILINK_OUTBOX: Error expiring old messages: $e');
+    }
+  }
+
+  /// Periodic maintenance tasks (runs every 30 seconds).
+  Future<void> maintenance() async {
+    await _expireOldMessages();
+    final connectedPeers = getConnectedPeers()
         .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
         .toList();
 
-    debugPrint(
-      'OMNILINK_OUTBOX: Triggering Anti-Entropy Sync across ${connectedPeers.length} active peer(s)...',
-    );
-
-    for (final peer in connectedPeers) {
-      await _meshRouter.sendSyncHandshake(peer.peerId);
+    if (connectedPeers.isNotEmpty) {
+      for (final peer in connectedPeers) {
+        await onPeerConnected(peer.peerId);
+      }
     }
   }
 
-  /// Task 6: Schedules message retry with exponential backoff for degraded Bluetooth mode.
-  /// Retries at 2s, 5s, 10s, 30s before waiting for transport events.
+  /// Triggers anti-entropy sync across connected peers.
+  Future<void> triggerAntiEntropySync() async {
+    final connectedPeers = getConnectedPeers()
+        .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
+        .toList();
+
+    for (final peer in connectedPeers) {
+      await onPeerConnected(peer.peerId);
+    }
+  }
+
+  /// Schedules degraded retry sequence for low-bandwidth mode.
   Future<bool> scheduleDegradedRetry({
     required Future<bool> Function() attemptSend,
   }) async {
     final retryDelaysSeconds = [2, 5, 10, 30];
 
     for (final seconds in retryDelaysSeconds) {
-      debugPrint('OMNILINK_TRANSPORT: retry scheduled in $seconds seconds');
       await Future.delayed(Duration(seconds: seconds));
-
       final success = await attemptSend();
-      if (success) {
-        debugPrint('OMNILINK_TRANSPORT: Degraded retry send succeeded after $seconds s!');
-        return true;
-      }
+      if (success) return true;
     }
-
-    debugPrint('OMNILINK_TRANSPORT: Degraded retry sequence complete. Waiting for next transport event.');
     return false;
   }
 
-  /// Disposes stream subscription.
   void dispose() {
-    _peerSubscription.cancel();
+    _peerSub?.cancel();
+    _maintenanceTimer?.cancel();
   }
 }

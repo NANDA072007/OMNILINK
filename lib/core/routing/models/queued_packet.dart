@@ -17,6 +17,10 @@ enum MessagePriority {
 
 enum RouteStrategy {
   direct,
+  distanceVector,
+  probabilistic,
+  controlledFlood,
+  storeAndForward,
   flooding,
   epidemic,
   prophet,
@@ -25,7 +29,7 @@ enum RouteStrategy {
   static RouteStrategy fromString(String val) {
     return RouteStrategy.values.firstWhere(
       (e) => e.name.toLowerCase() == val.toLowerCase(),
-      orElse: () => RouteStrategy.epidemic,
+      orElse: () => RouteStrategy.storeAndForward,
     );
   }
 }
