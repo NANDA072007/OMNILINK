@@ -1,7 +1,9 @@
 package org.omnilink.transport
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.LocationManager
@@ -142,6 +144,9 @@ class OmnilinkTransportPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
             "getTransportCapability" -> {
                 val capability = manager.getTransportCapabilityMap()
                 result.success(capability)
+            }
+            "getBluetoothUsageState" -> {
+                result.success(getBluetoothUsageStateMap())
             }
             "startForegroundService" -> {
                 val ctx = context
@@ -308,6 +313,54 @@ class OmnilinkTransportPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
 
         Log.i("OMNILINK_NATIVE_PERM", "getAndroidPermissionDetails: $details")
         return details
+    }
+
+    private fun getBluetoothUsageStateMap(): Map<String, Any?> {
+        val ctx = context ?: return mapOf("error" to "Context not available")
+        val bm = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = bm?.adapter ?: BluetoothAdapter.getDefaultAdapter()
+
+        val isBtEnabled = adapter?.isEnabled == true
+        val sdkInt = Build.VERSION.SDK_INT
+
+        var a2dpConnected = false
+        var headsetConnected = false
+
+        if (isBtEnabled && adapter != null) {
+            try {
+                val a2dpState = adapter.getProfileConnectionState(BluetoothProfile.A2DP)
+                a2dpConnected = (a2dpState == BluetoothProfile.STATE_CONNECTED)
+
+                val headsetState = adapter.getProfileConnectionState(BluetoothProfile.HEADSET)
+                headsetConnected = (headsetState == BluetoothProfile.STATE_CONNECTED)
+            } catch (e: SecurityException) {
+                Log.e(TAG, "SecurityException checking Bluetooth profile connection state: ${e.message}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception checking Bluetooth profile connection state: ${e.message}")
+            }
+        }
+
+        val audioConnected = a2dpConnected || headsetConnected
+        val bleSupported = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)
+        val locationReq = sdkInt <= 31
+
+        val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val isWifiEnabled = wm?.isWifiEnabled == true
+
+        val modeStr = if (!isBtEnabled) "offlineQueue" else if (isWifiEnabled) "highSpeed" else if (audioConnected) "degradedTextOnly" else "highSpeed"
+        Log.i("OMNILINK_TRANSPORT", "bluetoothAudioConnected=$audioConnected wifiEnabled=$isWifiEnabled")
+        Log.i("OMNILINK_TRANSPORT", "selectedMode=$modeStr")
+
+        return mapOf(
+            "bluetoothEnabled" to isBtEnabled,
+            "wifiEnabled" to isWifiEnabled,
+            "audioDeviceConnected" to audioConnected,
+            "headsetConnected" to headsetConnected,
+            "a2dpConnected" to a2dpConnected,
+            "bleScanSupported" to bleSupported,
+            "locationRequiredForScan" to locationReq,
+            "androidSdkInt" to sdkInt
+        )
     }
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {

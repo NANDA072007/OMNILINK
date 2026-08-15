@@ -10,6 +10,7 @@ import 'package:uuid/uuid.dart';
 import '../../core/models/message.dart';
 import '../../core/models/packet_envelope.dart';
 import '../../core/providers.dart';
+import '../../transport_bridge/android_transport_adapter.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String peerId;
@@ -230,10 +231,46 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
         // Store encrypted envelope in persistent SQLite Outbox
         await outboxRepo.saveToOutbox(envelope);
+
+        final adapter = ref.read(transportAdapterProvider);
+        final usageMap = (adapter is AndroidTransportAdapter)
+            ? await adapter.getBluetoothUsageState()
+            : null;
+
+        final isAudioConnected = usageMap?['audioDeviceConnected'] == true;
+        final isWifiEnabled = usageMap?['wifiEnabled'] == true;
+
+        final envelopeJson = jsonEncode(envelope.toMap());
+        final packetSizeBytes = utf8.encode(envelopeJson).length;
+
+        if (isAudioConnected && !isWifiEnabled && packetSizeBytes >= 1024) {
+          debugPrint('OMNILINK_TRANSPORT: message queued due to degraded Bluetooth');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Large messages will be sent when a faster route is available.',
+                ),
+              ),
+            );
+          }
+          return;
+        }
+
         debugPrint('OMNILINK_TRANSPORT: message queued because no active route');
 
         // Trigger background Anti-Entropy Summary Vector Exchange across active radio links
         await daemon.triggerAntiEntropySync();
+
+        if (isAudioConnected && !isWifiEnabled && packetSizeBytes < 1024) {
+          unawaited(
+            daemon.scheduleDegradedRetry(attemptSend: () async {
+              await daemon.triggerAntiEntropySync();
+              final isConnected = await adapter.isConnected(widget.peerId);
+              return isConnected;
+            }),
+          );
+        }
       } catch (e) {
         debugPrint('OMNILINK_UI: Exception during background outbox queueing: $e');
       }

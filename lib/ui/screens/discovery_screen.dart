@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../core/models/peer_device.dart';
+import '../../core/models/transport_health.dart';
 import '../../core/providers.dart';
 import '../../transport_bridge/android_transport_adapter.dart';
 import 'chat_screen.dart';
@@ -217,7 +218,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     }
   }
 
-  /// Task #3: User-Visible Transport Status Card with Graceful Degradation
+  /// Task 4: User-Visible Transport Status Card displaying Bluetooth Audio & Mode Health
   Widget _buildRadioWarningBanner() {
     final diag = _diag;
     if (diag == null) return const SizedBox.shrink();
@@ -227,13 +228,18 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
     final locOff = diag.locationEnabled == false;
     final isAndroid11OrBelow = diag.sdkInt <= 31;
 
-    // Bluetooth is REQUIRED. Wi-Fi is OPTIONAL. Location is CONDITIONAL on Android <= 11.
-    final bool hasIssue = btOff || wifiOff || (isAndroid11OrBelow && locOff);
-    if (!hasIssue) return const SizedBox.shrink();
+    final health = TransportHealth.evaluate(
+      bluetoothEnabled: !btOff,
+      wifiEnabled: !wifiOff,
+      locationEnabled: !locOff,
+      audioDeviceConnected: false,
+      headsetConnected: false,
+      canDiscover: !isAndroid11OrBelow || !locOff,
+    );
 
     final cardColor = btOff
-        ? const Color(0xFFD32F2F) // Red if Bluetooth (REQUIRED) is OFF
-        : Colors.amber.shade900; // Yellow if Wi-Fi / Location (OPTIONAL) is OFF
+        ? const Color(0xFFD32F2F)
+        : (wifiOff ? Colors.amber.shade900 : const Color(0xFF1E88E5));
 
     return Container(
       color: cardColor,
@@ -253,7 +259,7 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
                 child: Text(
                   btOff
                       ? 'BLUETOOTH REQUIRED'
-                      : (wifiOff ? 'WI-FI SPEED BOOSTER OFF' : 'LOCATION CONDITIONAL NOTICE'),
+                      : 'MODE: ${health.recommendedMode.name.toUpperCase()}',
                   style: const TextStyle(
                     fontWeight: FontWeight.bold,
                     color: Colors.white,
@@ -274,21 +280,10 @@ class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
             ],
           ),
           const SizedBox(height: 6),
-          if (btOff)
-            const Text(
-              'Bluetooth is required to discover and connect to nearby mesh devices.',
-              style: TextStyle(color: Colors.white, fontSize: 11),
-            )
-          else if (wifiOff)
-            const Text(
-              'Wi-Fi is off. Delivery may be slower. Text messages can still be queued over Bluetooth.',
-              style: TextStyle(color: Colors.white, fontSize: 11),
-            )
-          else if (isAndroid11OrBelow && locOff)
-            const Text(
-              'Android 11 requires Location to discover new nearby devices. You can still connect to paired devices.',
-              style: TextStyle(color: Colors.white, fontSize: 11),
-            ),
+          Text(
+            health.userMessage,
+            style: const TextStyle(color: Colors.white, fontSize: 11),
+          ),
         ],
       ),
     );

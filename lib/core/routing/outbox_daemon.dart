@@ -52,6 +52,28 @@ class OutboxDaemon {
     }
   }
 
+  /// Task 6: Schedules message retry with exponential backoff for degraded Bluetooth mode.
+  /// Retries at 2s, 5s, 10s, 30s before waiting for transport events.
+  Future<bool> scheduleDegradedRetry({
+    required Future<bool> Function() attemptSend,
+  }) async {
+    final retryDelaysSeconds = [2, 5, 10, 30];
+
+    for (final seconds in retryDelaysSeconds) {
+      debugPrint('OMNILINK_TRANSPORT: retry scheduled in $seconds seconds');
+      await Future.delayed(Duration(seconds: seconds));
+
+      final success = await attemptSend();
+      if (success) {
+        debugPrint('OMNILINK_TRANSPORT: Degraded retry send succeeded after $seconds s!');
+        return true;
+      }
+    }
+
+    debugPrint('OMNILINK_TRANSPORT: Degraded retry sequence complete. Waiting for next transport event.');
+    return false;
+  }
+
   /// Disposes stream subscription.
   void dispose() {
     _peerSubscription.cancel();

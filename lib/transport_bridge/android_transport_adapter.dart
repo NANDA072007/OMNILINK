@@ -58,10 +58,22 @@ class AndroidTransportAdapter implements TransportAdapter {
       debugPrint(
         'OMNILINK_TRANSPORT: capability bluetooth=${cap.bluetoothEnabled} wifi=${cap.wifiEnabled} location=${cap.locationEnabled} sdk=${cap.androidSdkInt}',
       );
-      debugPrint('OMNILINK_TRANSPORT: selected mode=${cap.selectTransportMode().name}');
       return cap;
     } catch (e) {
       debugPrint('OMNILINK_DART: Error fetching TransportCapability: $e');
+      return null;
+    }
+  }
+
+  /// Fetches Bluetooth usage and profile connection state (A2DP / Headset audio).
+  Future<Map<String, dynamic>?> getBluetoothUsageState() async {
+    try {
+      final map = await _controlChannel.invokeMapMethod<String, dynamic>(
+        'getBluetoothUsageState',
+      );
+      return map;
+    } catch (e) {
+      debugPrint('OMNILINK_DART: Error fetching Bluetooth usage state: $e');
       return null;
     }
   }
