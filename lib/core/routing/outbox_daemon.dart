@@ -24,7 +24,7 @@ class OutboxDaemon {
 
   StreamSubscription<PeerConnectionEvent>? _peerSub;
   Timer? _maintenanceTimer;
-  bool _isFlushing = false;
+  final Set<String> _flushingPeerIds = {};
 
   OutboxDaemon({
     required this.db,
@@ -97,8 +97,9 @@ class OutboxDaemon {
 
   /// Flushes matching outbox packets when a new peer connects.
   Future<void> onPeerConnected(String peerId) async {
-    if (_isFlushing) return;
-    _isFlushing = true;
+    if (_flushingPeerIds.contains(peerId)) return;
+    _flushingPeerIds.add(peerId);
+    debugPrint('OMNILINK_FIX: Locked outbox flush for peer $peerId');
 
     try {
       debugPrint('OMNILINK_OUTBOX: Peer connected ($peerId). Processing pending outbox items...');
@@ -135,7 +136,12 @@ class OutboxDaemon {
       for (final packet in relevantPackets) {
         final payloadBytes = utf8.encode(packet.payload);
 
-        final success = await transport.sendPacket(peerId, payloadBytes);
+        debugPrint('OMNILINK_FIX: Flushing outbox packet ${packet.packetId} through SendQueueManager for peer $peerId');
+        final success = await router.sendQueueManager.enqueueAndSend(
+          packetId: packet.packetId,
+          peerId: peerId,
+          payloadBytes: payloadBytes,
+        );
 
         if (success) {
           await db.deleteQueuedPacket(packet.packetId);
@@ -148,7 +154,8 @@ class OutboxDaemon {
     } catch (e) {
       debugPrint('OMNILINK_OUTBOX: Exception during outbox flush: $e');
     } finally {
-      _isFlushing = false;
+      _flushingPeerIds.remove(peerId);
+      debugPrint('OMNILINK_FIX: Unlocked outbox flush for peer $peerId');
     }
   }
 

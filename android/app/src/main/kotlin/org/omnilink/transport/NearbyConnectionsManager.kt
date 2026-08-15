@@ -540,6 +540,16 @@ class NearbyConnectionsManager private constructor(private val context: Context)
                 PayloadTransferUpdate.Status.SUCCESS -> {
                     Log.d(TAG, "OMNILINK_NEARBY: [t=$tUpdate] payload transfer SUCCESS for $endpointId (<50ms radio delivery)")
                     inFlightPayloads[endpointId] = false
+                    OmnilinkTransportPlugin.sendEvent(
+                        mapOf(
+                            "eventType" to "onPayloadTransferUpdate",
+                            "peerId" to endpointId,
+                            "payloadId" to update.payloadId,
+                            "status" to "SUCCESS",
+                            "bytesTransferred" to update.bytesTransferred,
+                            "totalBytes" to update.totalBytes
+                        )
+                    )
                     // Trigger next item in native outbound queue immediately
                     handler.post { processNextPayload(endpointId) }
                 }
@@ -547,6 +557,16 @@ class NearbyConnectionsManager private constructor(private val context: Context)
                 PayloadTransferUpdate.Status.CANCELED -> {
                     Log.e(TAG, "OMNILINK_NEARBY: [t=$tUpdate] payload transfer status=${update.status} for $endpointId")
                     inFlightPayloads[endpointId] = false
+                    OmnilinkTransportPlugin.sendEvent(
+                        mapOf(
+                            "eventType" to "onPayloadTransferUpdate",
+                            "peerId" to endpointId,
+                            "payloadId" to update.payloadId,
+                            "status" to "FAILED",
+                            "bytesTransferred" to update.bytesTransferred,
+                            "totalBytes" to update.totalBytes
+                        )
+                    )
                     // Trigger next item in native outbound queue immediately
                     handler.post { processNextPayload(endpointId) }
                 }

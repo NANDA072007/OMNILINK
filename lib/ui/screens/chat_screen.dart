@@ -55,6 +55,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     });
   }
 
+  /// Resolves the remote peer's 64-character cryptographic nodeId from peerListProvider.
+  String _resolveRemoteNodeId() {
+    final activePeers = ref.read(peerListProvider);
+    for (final p in activePeers) {
+      if (p.peerId == widget.peerId && p.nodeId != null && p.nodeId!.isNotEmpty) {
+        return p.nodeId!;
+      }
+      if (p.nodeId == widget.peerId) {
+        return p.nodeId!;
+      }
+    }
+    return widget.peerId;
+  }
+
+  /// Derives symmetric SecretKey using deterministic, sorted node ID concatenation.
+  Future<SecretKey> _deriveSymmetricKey(String localNodeId, String remoteNodeId) async {
+    final cryptoService = ref.read(cryptoServiceProvider);
+    final sortedNodes = [localNodeId, remoteNodeId]..sort();
+    final keySeedInput = '${sortedNodes[0]}:${sortedNodes[1]}';
+    final keySeed = await cryptoService.sha256Hex(
+      Uint8List.fromList(utf8.encode(keySeedInput)),
+    );
+    debugPrint('OMNILINK_FIX: Derived symmetric key for sorted nodes: $keySeedInput');
+    return SecretKey(utf8.encode(keySeed.substring(0, 32)));
+  }
+
   /// Listens to local inbound stream from the central RouterEngine.
   void _subscribeToIncomingEnvelopes() {
     final router = ref.read(routerEngineProvider);
@@ -67,13 +93,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     debugPrint('OMNILINK_DART: [t=$tRecv] incoming packet senderPeerId=${envelope.senderId}');
     debugPrint('OMNILINK_DART: [t=$tRecv] current chat peerId=${widget.peerId}');
 
+    final resolvedRemoteNodeId = _resolveRemoteNodeId();
+
     // Filter matching peer (allow prefix matching for Node ID / endpoint ID)
     final isMatchingPeer = envelope.senderId == widget.peerId ||
+        envelope.senderId == resolvedRemoteNodeId ||
         envelope.senderId.startsWith(widget.peerId) ||
         widget.peerId.startsWith(envelope.senderId);
 
     if (!isMatchingPeer) {
-      debugPrint('OMNILINK_DART: [t=$tRecv] ignored envelope because senderId (${envelope.senderId}) does not match current chat peerId (${widget.peerId})');
+      debugPrint('OMNILINK_DART: [t=$tRecv] ignored envelope because senderId (${envelope.senderId}) does not match current chat peerId (${widget.peerId}) or resolvedNodeId ($resolvedRemoteNodeId)');
       return;
     }
 
@@ -93,14 +122,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
       if (envelope.messageType == 'MESSAGE_PAYLOAD') {
         final cryptoService = ref.read(cryptoServiceProvider);
-
-        // Derive symmetric key for payload decryption
-        final keySeed = await cryptoService.sha256Hex(
-          Uint8List.fromList(
-            utf8.encode('${envelope.senderId}:${envelope.recipientId}'),
-          ),
-        );
-        final secretKey = SecretKey(utf8.encode(keySeed.substring(0, 32)));
+        // Derive symmetric key for payload decryption using deterministic sorted node IDs
+        final secretKey = await _deriveSymmetricKey(envelope.recipientId, envelope.senderId);
 
         // Decrypt ChaCha20-Poly1305 payload
         final decryptedBytes = await cryptoService.decryptPayload(
@@ -219,14 +242,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // 2. ASYNCHRONOUS BACKGROUND ENCRYPTION & EPIDEMIC OUTBOX SYNC (Non-blocking)
     unawaited(() async {
       try {
-        final cryptoService = ref.read(cryptoServiceProvider);
         final packetService = ref.read(packetServiceProvider);
+        final resolvedRemoteNodeId = _resolveRemoteNodeId();
 
-        final keySeed = await cryptoService.sha256Hex(
-          Uint8List.fromList(utf8.encode('$myNodeId:${widget.peerId}')),
-        );
-        final secretKey = SecretKey(utf8.encode(keySeed.substring(0, 32)));
+        final secretKey = await _deriveSymmetricKey(myNodeId, resolvedRemoteNodeId);
 
+        final cryptoService = ref.read(cryptoServiceProvider);
         final encryptedPayloadBase64 = await cryptoService.encryptPayload(
           plaintext: Uint8List.fromList(utf8.encode(text)),
           secretKey: secretKey,
@@ -234,7 +255,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
         final envelope = await packetService.createEnvelope(
           senderNodeId: myNodeId,
-          recipientNodeId: widget.peerId,
+          recipientNodeId: resolvedRemoteNodeId,
           messageType: 'MESSAGE_PAYLOAD',
           encryptedPayloadBase64: encryptedPayloadBase64,
           senderKeyPair: masterKeyPair,
