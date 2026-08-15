@@ -9,6 +9,7 @@ import '../models/packet_envelope.dart';
 import '../models/peer_device.dart';
 import 'models/queued_packet.dart';
 import 'models/route_entry.dart';
+import 'route_protocol.dart';
 import 'routing_database.dart';
 
 enum RouteStrategy {
@@ -59,6 +60,7 @@ class RouterEngine {
   final RoutingDatabaseService db;
   final String Function() getMyNodeId;
   final List<PeerDevice> Function() getConnectedPeers;
+  late final RouteProtocol routeProtocol;
 
   final _localInboundController = StreamController<PacketEnvelope>.broadcast();
   final _routingEventsController = StreamController<RoutingEvent>.broadcast();
@@ -75,6 +77,15 @@ class RouterEngine {
     required this.getMyNodeId,
     required this.getConnectedPeers,
   }) {
+    routeProtocol = RouteProtocol(
+      router: this,
+      transport: transport,
+      packetService: packetService,
+      db: db,
+      cryptoService: cryptoService,
+      getMyNodeId: getMyNodeId,
+      getConnectedPeers: getConnectedPeers,
+    );
     _init();
   }
 
@@ -84,7 +95,8 @@ class RouterEngine {
     _maintenanceTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       _periodicMaintenance();
     });
-    debugPrint('OMNILINK_ROUTER: RouterEngine initialized and listening globally.');
+    routeProtocol.startPeriodicSync(interval: const Duration(seconds: 45));
+    debugPrint('OMNILINK_ROUTER: RouterEngine initialized with RouteProtocol.');
   }
 
   Stream<PacketEnvelope> get localInboundStream => _localInboundController.stream;
@@ -137,8 +149,29 @@ class RouterEngine {
         } else if (envelope.messageType == 'DELIVERY_RECEIPT') {
           await _handleDeliveryReceipt(envelope);
         } else if (envelope.messageType == 'ROUTING_TABLE_SYNC') {
-          await _handleRouteAdvertisement(envelope);
+          await routeProtocol.handleRoutingTableSync(envelope, event.senderPeerId);
+        } else if (envelope.messageType == 'ROUTE_ADVERTISEMENT') {
+          await routeProtocol.handleRouteAdvertisement(envelope, event.senderPeerId);
+        } else if (envelope.messageType == 'ROUTE_REQUEST') {
+          await routeProtocol.handleRouteRequest(envelope, event.senderPeerId);
+        } else if (envelope.messageType == 'ROUTE_REPLY') {
+          await routeProtocol.handleRouteReply(envelope, event.senderPeerId);
         }
+        return;
+      }
+
+      // Handle non-local control packets
+      if (envelope.messageType == 'ROUTING_TABLE_SYNC') {
+        await routeProtocol.handleRoutingTableSync(envelope, event.senderPeerId);
+        return;
+      } else if (envelope.messageType == 'ROUTE_ADVERTISEMENT') {
+        await routeProtocol.handleRouteAdvertisement(envelope, event.senderPeerId);
+        return;
+      } else if (envelope.messageType == 'ROUTE_REQUEST') {
+        await routeProtocol.handleRouteRequest(envelope, event.senderPeerId);
+        return;
+      } else if (envelope.messageType == 'ROUTE_REPLY') {
+        await routeProtocol.handleRouteReply(envelope, event.senderPeerId);
         return;
       }
 
@@ -255,6 +288,7 @@ class RouterEngine {
 
     // Layer 4: Controlled Flood
     if (candidatePeers.isNotEmpty) {
+      unawaited(routeProtocol.sendRouteRequest(envelope.recipientId));
       return RouteDecision(
         strategy: RouteStrategy.controlledFlood,
         peerIds: candidatePeers.map((p) => p.peerId).toList(),
@@ -263,6 +297,7 @@ class RouterEngine {
     }
 
     // Layer 5: Store-and-Forward / Outbox Queue
+    unawaited(routeProtocol.sendRouteRequest(envelope.recipientId));
     return const RouteDecision(
       strategy: RouteStrategy.storeAndForward,
       reason: 'No active radio paths. Saved to SQLite outbox queue.',
@@ -352,9 +387,7 @@ class RouterEngine {
     );
   }
 
-  Future<void> _handleRouteAdvertisement(PacketEnvelope syncEnvelope) async {
-    debugPrint('OMNILINK_ROUTER: Received ROUTING_TABLE_SYNC from ${syncEnvelope.senderId}');
-  }
+
 
   // ===========================================================================
   // 6. OUTBOX FLUSH ON PEER CONNECT
@@ -362,6 +395,7 @@ class RouterEngine {
 
   Future<void> _handlePeerEvent(PeerConnectionEvent event) async {
     if (event.eventType == PeerConnectionEventType.onConnected) {
+      await routeProtocol.sendRouteAdvertisement(event.peerId);
       await _onPeerConnected(event.peerId);
     }
   }
@@ -403,7 +437,40 @@ class RouterEngine {
     }
   }
 
+  /// Flushes pending outbox packets destined for targetNodeId when a route is discovered.
+  Future<void> flushOutboxForDestination(String destinationNodeId) async {
+    debugPrint('OMNILINK_ROUTER: Route discovered for $destinationNodeId. Retrying outbox queue...');
+    final pending = await db.getPendingOutboxPackets();
+    final targetPackets = pending.where((p) => p.recipientNodeId == destinationNodeId).toList();
+
+    for (final packet in targetPackets) {
+      final envelope = PacketEnvelope.fromJson(packet.payload);
+      final decision = await _selectNextHop(envelope);
+
+      if (decision.strategy != RouteStrategy.storeAndForward) {
+        final bytes = utf8.encode(packet.payload);
+        bool anySent = false;
+
+        if (decision.peerId != null) {
+          anySent = await transport.sendPacket(decision.peerId!, bytes);
+        } else if (decision.peerIds != null) {
+          for (final peerId in decision.peerIds!) {
+            final sent = await transport.sendPacket(peerId, bytes);
+            if (sent) anySent = true;
+          }
+        }
+
+        if (anySent) {
+          await db.deleteQueuedPacket(packet.packetId);
+          debugPrint('OMNILINK_ROUTER: Flushed queued packet ${packet.packetId} to $destinationNodeId via ${decision.strategy.name}');
+          _emitEvent('forwarded', packet.packetId, 'outbox_flush', peerId: decision.peerId);
+        }
+      }
+    }
+  }
+
   void dispose() {
+    routeProtocol.dispose();
     _packetSubscription?.cancel();
     _peerSubscription?.cancel();
     _maintenanceTimer?.cancel();
