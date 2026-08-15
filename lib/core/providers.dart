@@ -13,8 +13,11 @@ import 'models/peer_device.dart';
 import 'repositories/message_repository.dart';
 import 'repositories/outbox_repository.dart';
 import 'repositories/peer_repository.dart';
+import 'models/packet_envelope.dart';
 import 'routing/mesh_router.dart';
 import 'routing/outbox_daemon.dart';
+import 'routing/providers.dart';
+import 'routing/router_engine.dart';
 
 // 1. Core Services & Database
 final cryptoServiceProvider = Provider<CryptoService>((ref) => CryptoService());
@@ -257,4 +260,23 @@ final outboxDaemonProvider = Provider<OutboxDaemon>((ref) {
   );
   ref.onDispose(() => daemon.dispose());
   return daemon;
+});
+
+// 8. Central 5-Layer Router Engine Provider
+final routerEngineProvider = Provider<RouterEngine>((ref) {
+  final engine = RouterEngine(
+    transport: ref.watch(transportAdapterProvider),
+    packetService: ref.watch(packetServiceProvider),
+    cryptoService: ref.watch(cryptoServiceProvider),
+    db: ref.watch(routingDatabaseProvider),
+    getMyNodeId: () => ref.read(identityProvider).nodeId ?? '',
+    getConnectedPeers: () => ref.read(peerListProvider),
+  );
+  ref.onDispose(() => engine.dispose());
+  return engine;
+});
+
+final localInboundStreamProvider = StreamProvider<PacketEnvelope>((ref) {
+  final router = ref.watch(routerEngineProvider);
+  return router.localInboundStream;
 });

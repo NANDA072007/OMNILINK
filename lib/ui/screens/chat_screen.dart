@@ -50,14 +50,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   /// Sends application-level PING on chat open to test bidirectional channel.
   void _sendInitialPing() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final router = ref.read(meshRouterProvider);
-      router.sendPing(widget.peerId, widget.peerId);
+      // Chat session established
     });
   }
 
-  /// Listens to local inbound stream from the global MeshRouter.
+  /// Listens to local inbound stream from the central RouterEngine.
   void _subscribeToIncomingEnvelopes() {
-    final router = ref.read(meshRouterProvider);
+    final router = ref.read(routerEngineProvider);
     _envelopeSubscription = router.localInboundStream.listen(_handleIncomingEnvelope);
   }
 
@@ -157,8 +156,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         encryptedPayload: messageId,
       );
 
-      final router = ref.read(meshRouterProvider);
-      await router.broadcastEnvelope(envelope, targetPeerId: widget.peerId);
+      final router = ref.read(routerEngineProvider);
+      await router.sendMessage(envelope);
       debugPrint('OMNILINK_DART: [t=$t0] sent DELIVERY_RECEIPT for $messageId to $recipientId');
     } catch (e) {
       debugPrint('OMNILINK_DART: [t=$t0] failed to send DELIVERY_RECEIPT: $e');
@@ -184,7 +183,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final daemon = ref.read(outboxDaemonProvider);
     final messageId = _uuid.v4();
     final messageRepo = ref.read(messageRepositoryProvider);
-    final outboxRepo = ref.read(outboxRepositoryProvider);
 
     // 1. INSTANT LOCAL SAVE & UI REFRESH (< 20ms execution)
     final draftMessage = Message(
@@ -229,8 +227,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           senderKeyPair: masterKeyPair,
         );
 
-        // Store encrypted envelope in persistent SQLite Outbox
-        await outboxRepo.saveToOutbox(envelope);
+        // Pass envelope to central RouterEngine for 5-layer route selection & transmission
+        final routerEngine = ref.read(routerEngineProvider);
+        await routerEngine.sendMessage(envelope);
 
         final adapter = ref.read(transportAdapterProvider);
         final usageMap = (adapter is AndroidTransportAdapter)
