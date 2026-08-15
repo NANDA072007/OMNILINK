@@ -9,6 +9,7 @@ import '../crypto/packet_service.dart';
 import '../models/packet_envelope.dart';
 import '../models/peer_device.dart';
 import 'models/route_entry.dart';
+import 'prophet_engine.dart';
 import 'router_engine.dart';
 import 'routing_database.dart';
 
@@ -21,6 +22,7 @@ class RouteProtocol {
   final PacketService packetService;
   final RoutingDatabaseService db;
   final CryptoService cryptoService;
+  final ProphetEngine prophetEngine;
   final String Function() getMyNodeId;
   final List<PeerDevice> Function() getConnectedPeers;
 
@@ -32,6 +34,7 @@ class RouteProtocol {
     required this.packetService,
     required this.db,
     required this.cryptoService,
+    required this.prophetEngine,
     required this.getMyNodeId,
     required this.getConnectedPeers,
   });
@@ -109,11 +112,13 @@ class RouteProtocol {
       final entriesList = jsonDecode(envelope.encryptedPayload) as List<dynamic>;
       int mergedCount = 0;
 
+      final vectorMap = <String, double>{};
       for (final item in entriesList) {
         final map = item as Map<String, dynamic>;
         final destId = map['destinationNodeId'] as String;
         final remoteHopCount = (map['hopCount'] as num).toInt();
         final remoteProb = (map['probability'] as num).toDouble();
+        vectorMap[destId] = remoteProb;
 
         if (destId == getMyNodeId()) continue;
 
@@ -136,6 +141,7 @@ class RouteProtocol {
         }
       }
 
+      await prophetEngine.exchangePredictability(fromPeerId, vectorMap);
       debugPrint('OMNILINK_ROUTE: merged $mergedCount routes from peer $fromPeerId');
     } catch (e) {
       debugPrint('OMNILINK_ROUTE: Error merging ROUTING_TABLE_SYNC: $e');

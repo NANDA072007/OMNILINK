@@ -7,8 +7,10 @@ import '../crypto/crypto_service.dart';
 import '../crypto/packet_service.dart';
 import '../models/packet_envelope.dart';
 import '../models/peer_device.dart';
+import 'models/neighbor_info.dart';
 import 'models/queued_packet.dart';
 import 'models/route_entry.dart';
+import 'prophet_engine.dart';
 import 'route_protocol.dart';
 import 'routing_database.dart';
 
@@ -60,6 +62,7 @@ class RouterEngine {
   final RoutingDatabaseService db;
   final String Function() getMyNodeId;
   final List<PeerDevice> Function() getConnectedPeers;
+  late final ProphetEngine prophetEngine;
   late final RouteProtocol routeProtocol;
 
   final _localInboundController = StreamController<PacketEnvelope>.broadcast();
@@ -77,12 +80,14 @@ class RouterEngine {
     required this.getMyNodeId,
     required this.getConnectedPeers,
   }) {
+    prophetEngine = ProphetEngine(db: db);
     routeProtocol = RouteProtocol(
       router: this,
       transport: transport,
       packetService: packetService,
       db: db,
       cryptoService: cryptoService,
+      prophetEngine: prophetEngine,
       getMyNodeId: getMyNodeId,
       getConnectedPeers: getConnectedPeers,
     );
@@ -133,8 +138,8 @@ class RouterEngine {
       // Mark processed
       packetService.markProcessed(envelope.packetId);
 
-      // Record encounter with sender
-      await db.recordEncounter(envelope.senderId, event.senderPeerId);
+      // Record encounter with sender and update PRoPHET probabilities
+      await prophetEngine.recordEncounter(envelope.senderId, event.senderPeerId);
 
       final myNodeId = getMyNodeId();
 
@@ -273,17 +278,26 @@ class RouterEngine {
       }
     }
 
-    // Layer 3: PRoPHET Probabilistic
-    final encounter = await db.getEncounterByNodeId(envelope.recipientId);
-    if (encounter != null && encounter.predictability > 0.15) {
-      final isRelayConnected = connectedPeers.any((p) => p.peerId == encounter.peerId);
-      if (isRelayConnected && encounter.peerId != ingressPeerId) {
-        return RouteDecision(
-          strategy: RouteStrategy.probabilistic,
-          peerId: encounter.peerId,
-          reason: 'PRoPHET predictability (${encounter.predictability}) > 0.15 threshold',
-        );
-      }
+    // Layer 3: PRoPHET Probabilistic (ProphetEngine)
+    final neighborInfos = candidatePeers.map((p) => NeighborInfo(
+      peerId: p.peerId,
+      nodeId: p.nodeId,
+      friendlyName: p.friendlyName,
+      rssi: p.rssi,
+      linkQuality: NeighborInfo.computeLinkQuality(p.rssi),
+      firstSeen: p.lastSeenAt,
+      lastSeen: p.lastSeenAt,
+      isConnected: true,
+    )).toList();
+
+    final prophetSelection = await prophetEngine.selectBestRelay(envelope.recipientId, neighborInfos);
+    if (prophetSelection.peer != null && prophetSelection.score > 0.15) {
+      debugPrint('OMNILINK_PROPHET: Layer 3 selected relay ${prophetSelection.peer!.peerId} with score ${prophetSelection.score.toStringAsFixed(3)}');
+      return RouteDecision(
+        strategy: RouteStrategy.probabilistic,
+        peerId: prophetSelection.peer!.peerId,
+        reason: 'PRoPHET probabilistic relay score (${prophetSelection.score.toStringAsFixed(3)}) > 0.15 threshold',
+      );
     }
 
     // Layer 4: Controlled Flood
@@ -426,7 +440,7 @@ class RouterEngine {
 
   Future<void> _periodicMaintenance() async {
     debugPrint('OMNILINK_ROUTER: Running 30s periodic maintenance...');
-    await db.decayEncounters();
+    await prophetEngine.decayProbabilities();
 
     final connectedPeers = getConnectedPeers()
         .where((p) => p.connectionStatus == PeerConnectionStatus.connected)

@@ -17,6 +17,7 @@ import 'models/packet_envelope.dart';
 import 'routing/mesh_router.dart';
 import 'routing/outbox_daemon.dart';
 import 'routing/providers.dart';
+import 'routing/prophet_engine.dart';
 import 'routing/router_engine.dart';
 
 // 1. Core Services & Database
@@ -279,4 +280,9 @@ final routerEngineProvider = Provider<RouterEngine>((ref) {
 final localInboundStreamProvider = StreamProvider<PacketEnvelope>((ref) {
   final router = ref.watch(routerEngineProvider);
   return router.localInboundStream;
+});
+
+final prophetEngineProvider = Provider<ProphetEngine>((ref) {
+  final router = ref.watch(routerEngineProvider);
+  return router.prophetEngine;
 });
