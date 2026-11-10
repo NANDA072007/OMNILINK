@@ -13,6 +13,7 @@ import '../repositories/message_repository.dart';
 import '../repositories/peer_repository.dart';
 import '../database/database_service.dart';
 import 'models/queued_packet.dart';
+import 'models/route_entry.dart';
 import 'router_engine.dart' hide RouteStrategy;
 import 'routing_database.dart';
 
@@ -85,11 +86,32 @@ class OutboxDaemon {
     }
   }
 
-  /// Removes the durable copy after a verified end-to-end delivery receipt.
+  /// Moves a delivered packet into sent-history, then removes the outbox copy.
+  /// Sent-history lets anti-entropy answer a peer that missed the packet until
+  /// the envelope's own expiry.
   Future<void> acknowledgeDelivery(String packetId) async {
     try {
+      final packet = await db.getQueuedPacketById(packetId);
+      if (packet != null) {
+        var expiresAtMs =
+            DateTime.now().add(const Duration(hours: 24)).millisecondsSinceEpoch;
+        try {
+          expiresAtMs = PacketEnvelope.fromJson(packet.payload).expiresAt;
+        } catch (_) {
+          // Fall back to a bounded retention window if the payload is corrupt.
+        }
+
+        await db.insertSentPacket(
+          packetId: packet.packetId,
+          recipientNodeId: packet.recipientNodeId,
+          payload: packet.payload,
+          sentAtMs: DateTime.now().millisecondsSinceEpoch,
+          expiresAtMs: expiresAtMs,
+        );
+      }
+
       await db.deleteQueuedPacket(packetId);
-      AppLogger.info('End-to-end receipt confirmed for $packetId; outbox copy removed.', domain: LogDomain.routing);
+      AppLogger.info('End-to-end receipt confirmed for $packetId; moved to sent history.', domain: LogDomain.routing);
     } catch (e, s) {
       AppLogger.error('Error acknowledging delivered packet $packetId', domain: LogDomain.routing, error: e, stackTrace: s);
     }
@@ -247,14 +269,38 @@ class OutboxDaemon {
 
       if (pendingPackets.isEmpty) return;
 
-      // Filter packets for this peer (direct recipient, peerId/nodeId match, or valid mesh relay TTL)
-      final relevantPackets = pendingPackets.where((packet) {
+      // Controlled relay: offer a packet only to its direct recipient or to
+      // the active route's next hop. The old `ttl > 0` check flooded every
+      // queued packet to every connected peer.
+      final relevantPackets = <QueuedPacket>[];
+      final routeCache = <String, RouteEntry?>{};
+      final routeRequestsSent = <String>{};
+
+      for (final packet in pendingPackets) {
         final isDirect = packet.recipientNodeId == peerNodeId ||
-            packet.recipientNodeId == peerId ||
-            (peerNodeId != null && packet.recipientNodeId.contains(peerNodeId)) ||
-            (peerNodeId != null && peerNodeId.contains(packet.recipientNodeId));
-        return isDirect || packet.ttl > 0;
-      }).toList();
+            packet.recipientNodeId == peerId;
+        if (isDirect) {
+          relevantPackets.add(packet);
+          continue;
+        }
+
+        if (!routeCache.containsKey(packet.recipientNodeId)) {
+          routeCache[packet.recipientNodeId] =
+              await db.getTopProbableRelay(packet.recipientNodeId);
+        }
+        final route = routeCache[packet.recipientNodeId];
+        final isNextHop = route != null &&
+            route.isActive &&
+            (route.nextHopPeerId == peerId ||
+                (peerNodeId != null && route.nextHopNodeId == peerNodeId));
+
+        if (isNextHop) {
+          relevantPackets.add(packet);
+        } else if (routeRequestsSent.add(packet.recipientNodeId)) {
+          // No usable path: ask the mesh instead of blind-flooding payloads.
+          unawaited(router.routeProtocol.sendRouteRequest(packet.recipientNodeId));
+        }
+      }
 
       if (relevantPackets.isEmpty) return;
 
@@ -345,6 +391,21 @@ class OutboxDaemon {
       if (expiredIds.isNotEmpty) {
         final count = await db.deleteQueuedPacketsByIds(expiredIds);
         AppLogger.info('Batch expired $count old/failed packets from outbox queue', domain: LogDomain.routing);
+      }
+
+      final purgedHistory = await db.purgeExpiredSentHistory(
+        now.millisecondsSinceEpoch,
+      );
+      if (purgedHistory > 0) {
+        AppLogger.info('Purged $purgedHistory expired sent-history packet(s)', domain: LogDomain.routing);
+      }
+
+      final purgedProcessed =
+          await DatabaseService.instance.purgeExpiredProcessedPackets(
+        currentTimestampMs: now.millisecondsSinceEpoch,
+      );
+      if (purgedProcessed > 0) {
+        AppLogger.info('Purged $purgedProcessed expired processed-packet record(s)', domain: LogDomain.routing);
       }
     } catch (e, s) {
       AppLogger.error('Error expiring old messages', domain: LogDomain.routing, error: e, stackTrace: s);

@@ -579,12 +579,17 @@ class RouteProtocol {
       final myNodeId = getMyNodeId();
       if (myNodeId.isEmpty) return;
 
-      final pendingOutbox = await db.getPendingOutboxPackets();
-      final outboxPacketIds = pendingOutbox.map((p) => p.packetId).toList();
-      final processedIds = packetService.getProcessedPacketIds();
-
-      final allHeldIds = {...outboxPacketIds, ...processedIds}.toList();
       final now = DateTime.now().millisecondsSinceEpoch;
+      final outbox = await db.getAllQueuedPackets();
+      final outboxPacketIds = outbox.map((p) => p.packetId).toList();
+      final sentPacketIds = await db.getSentPacketIds(notExpiredAfter: now);
+      final processedIds = await packetService.getProcessedPacketIdsFromStore();
+
+      final allHeldIds = {
+        ...outboxPacketIds,
+        ...sentPacketIds,
+        ...processedIds,
+      }.toList();
 
       if (!supportsPagination) {
         // Fallback for legacy peers: Send bounded handshake (top 40 IDs max to fit in 4096 MTU)
@@ -779,17 +784,24 @@ class RouteProtocol {
         return;
       }
 
-      // Find missing packet IDs locally
-      final pendingOutbox = await db.getPendingOutboxPackets();
-      final localOutboxIds = pendingOutbox.map((p) => p.packetId).toSet();
-      final localProcessedIds = packetService.getProcessedPacketIds().toSet();
+      // Find missing packet IDs locally. The persistent processed set matters
+      // here: the RAM replay cache is empty after an app restart.
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final localOutboxIds = (await db.getAllQueuedPackets())
+          .map((p) => p.packetId)
+          .toSet();
+      final localSentIds =
+          (await db.getSentPacketIds(notExpiredAfter: nowMs)).toSet();
+      final localProcessedIds =
+          await packetService.getProcessedPacketIdsFromStore();
+      final localHeldIds = {
+        ...localOutboxIds,
+        ...localSentIds,
+        ...localProcessedIds,
+      };
 
-      final missingPacketIds = <String>[];
-      for (final remoteId in combinedRemoteIds) {
-        if (!localOutboxIds.contains(remoteId) && !localProcessedIds.contains(remoteId)) {
-          missingPacketIds.add(remoteId);
-        }
-      }
+      final missingPacketIds =
+          combinedRemoteIds.where((id) => !localHeldIds.contains(id)).toList();
 
       _syncSessionManager.completeSession(sessionId);
       debugPrint('OMNILINK_SYNC: Completed sync session $sessionId. Remote holds ${combinedRemoteIds.length}, missing ${missingPacketIds.length}');
@@ -808,16 +820,22 @@ class RouteProtocol {
       final map = jsonDecode(envelope.encryptedPayload) as Map<String, dynamic>;
       final remoteHeldIds = (map['heldPacketIds'] as List<dynamic>).cast<String>();
 
-      final pendingOutbox = await db.getPendingOutboxPackets();
-      final localOutboxIds = pendingOutbox.map((p) => p.packetId).toSet();
-      final localProcessedIds = packetService.getProcessedPacketIds().toSet();
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final localOutboxIds = (await db.getAllQueuedPackets())
+          .map((p) => p.packetId)
+          .toSet();
+      final localSentIds =
+          (await db.getSentPacketIds(notExpiredAfter: nowMs)).toSet();
+      final localProcessedIds =
+          await packetService.getProcessedPacketIdsFromStore();
+      final localHeldIds = {
+        ...localOutboxIds,
+        ...localSentIds,
+        ...localProcessedIds,
+      };
 
-      final missingPacketIds = <String>[];
-      for (final remoteId in remoteHeldIds) {
-        if (!localOutboxIds.contains(remoteId) && !localProcessedIds.contains(remoteId)) {
-          missingPacketIds.add(remoteId);
-        }
-      }
+      final missingPacketIds =
+          remoteHeldIds.where((id) => !localHeldIds.contains(id)).toList();
 
       debugPrint('OMNILINK_SYNC: Evaluated SYNC_HANDSHAKE from $fromPeerId: remote holds ${remoteHeldIds.length}, we are missing ${missingPacketIds.length}');
 
@@ -835,25 +853,32 @@ class RouteProtocol {
       final myNodeId = getMyNodeId();
       if (myNodeId.isEmpty) return;
 
-      final payloadJson = jsonEncode({
-        'senderNodeId': myNodeId,
-        'requestedPacketIds': missingPacketIds,
-      });
-      final now = DateTime.now().millisecondsSinceEpoch;
+      // A single SYNC_REQUEST with hundreds of IDs would exceed the 4096-byte
+      // MTU. Batch the request so anti-entropy works after a long offline gap.
+      const int batchSize = 40;
+      for (var start = 0; start < missingPacketIds.length; start += batchSize) {
+        final end = min(start + batchSize, missingPacketIds.length);
+        final batch = missingPacketIds.sublist(start, end);
+        final payloadJson = jsonEncode({
+          'senderNodeId': myNodeId,
+          'requestedPacketIds': batch,
+        });
+        final now = DateTime.now().millisecondsSinceEpoch;
 
-      final envelope = await _buildControlEnvelope(
-        recipientNodeId: targetPeerId,
-        messageType: 'SYNC_REQUEST',
-        payloadJson: payloadJson,
-        packetId: 'syncreq_${now}_$myNodeId',
-        validity: const Duration(minutes: 5),
-      );
-      if (envelope == null) return;
+        final envelope = await _buildControlEnvelope(
+          recipientNodeId: targetPeerId,
+          messageType: 'SYNC_REQUEST',
+          payloadJson: payloadJson,
+          packetId: 'syncreq_${now}_${start}_$myNodeId',
+          validity: const Duration(minutes: 5),
+        );
+        if (envelope == null) return;
 
-      final bytes = utf8.encode(envelope.toJson());
-      await _sendViaQueue(targetPeerId, bytes, packetId: envelope.packetId);
+        final bytes = utf8.encode(envelope.toJson());
+        await _sendViaQueue(targetPeerId, bytes, packetId: envelope.packetId);
+      }
 
-      debugPrint('OMNILINK_SYNC: Sent SYNC_REQUEST for ${missingPacketIds.length} missing packet(s) to $targetPeerId');
+      debugPrint('OMNILINK_SYNC: Sent SYNC_REQUEST batches for ${missingPacketIds.length} missing packet(s) to $targetPeerId');
     } catch (e) {
       debugPrint('OMNILINK_SYNC: Error sending SYNC_REQUEST: $e');
     }
@@ -865,16 +890,45 @@ class RouteProtocol {
       final map = jsonDecode(envelope.encryptedPayload) as Map<String, dynamic>;
       final requestedIds = (map['requestedPacketIds'] as List<dynamic>).cast<String>().toSet();
 
-      final pendingOutbox = await db.getPendingOutboxPackets();
-      final matchingEnvelopes = pendingOutbox.where((p) => requestedIds.contains(p.packetId)).toList();
-
-      debugPrint('OMNILINK_SYNC: Received SYNC_REQUEST from $fromPeerId for ${requestedIds.length} packet(s). Found ${matchingEnvelopes.length} in outbox.');
-
-      for (final outboxPacket in matchingEnvelopes) {
-        final bytes = utf8.encode(outboxPacket.payload);
-        await _sendViaQueue(fromPeerId, bytes, packetId: outboxPacket.packetId);
-        debugPrint('OMNILINK_SYNC: Transmitted missing requested packet ${outboxPacket.packetId} to $fromPeerId');
+      final outboxPackets = await db.getAllQueuedPackets();
+      final matchingOutbox = outboxPackets
+          .where((p) => requestedIds.contains(p.packetId))
+          .toList();
+      final requestedList = requestedIds.toList();
+      final sentPayloads = <String, String>{};
+      for (var start = 0; start < requestedList.length; start += 400) {
+        final end = min(start + 400, requestedList.length);
+        sentPayloads.addAll(
+          await db.getSentPacketPayloadsByIds(
+            requestedList.sublist(start, end),
+          ),
+        );
       }
+
+      final servedIds = <String>{};
+      for (final outboxPacket in matchingOutbox) {
+        await _sendViaQueue(
+          fromPeerId,
+          utf8.encode(outboxPacket.payload),
+          packetId: outboxPacket.packetId,
+        );
+        servedIds.add(outboxPacket.packetId);
+      }
+      for (final entry in sentPayloads.entries) {
+        if (servedIds.contains(entry.key)) continue;
+        await _sendViaQueue(
+          fromPeerId,
+          utf8.encode(entry.value),
+          packetId: entry.key,
+        );
+        servedIds.add(entry.key);
+      }
+
+      debugPrint(
+        'OMNILINK_SYNC: Replied to SYNC_REQUEST from $fromPeerId with '
+        '${servedIds.length}/${requestedIds.length} packet(s) '
+        '(outbox=${matchingOutbox.length}, sentHistory=${sentPayloads.length}).',
+      );
     } catch (e) {
       debugPrint('OMNILINK_SYNC: Error handling SYNC_REQUEST: $e');
     }

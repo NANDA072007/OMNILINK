@@ -9,7 +9,7 @@ import 'schema_migrator.dart';
 /// WAL concurrency pragmas, and standard CRUD operations for OMNILINK offline mesh persistence.
 class DatabaseService {
   static const String _dbName = 'omnilink_mesh.db';
-  static const int currentVersion = 6;
+  static const int currentVersion = 7;
   static const int _dbVersion = currentVersion;
 
   static final DatabaseService instance = DatabaseService._internal();
@@ -38,6 +38,7 @@ class DatabaseService {
       await txn.delete('payload_chunks');
       await txn.delete('payload_transfers');
       await txn.delete('processed_packets');
+      await txn.delete('sent_history');
       await txn.delete('messages');
       await txn.delete('outbox_queue');
       await txn.delete('routing_table');
@@ -170,6 +171,19 @@ class DatabaseService {
     // Performance indexes
     await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);');
     await db.execute('CREATE INDEX IF NOT EXISTS idx_outbox_recipient ON outbox_queue(recipient_node_id);');
+
+    // Sent-history retention: lets SYNC_REQUEST answer after the outbox row is
+    // removed by a verified delivery receipt.
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sent_history (
+        packet_id TEXT PRIMARY KEY,
+        recipient_node_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        sent_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    ''');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_sent_history_expires ON sent_history(expires_at);');
 
     // 4. Payload Transfers table
     await db.execute('''
@@ -412,6 +426,22 @@ class DatabaseService {
           }
         },
       ),
+      SchemaMigrator(
+        fromVersion: 6,
+        toVersion: 7,
+        migrateStep: (txn) async {
+          await txn.execute('''
+            CREATE TABLE IF NOT EXISTS sent_history (
+              packet_id TEXT PRIMARY KEY,
+              recipient_node_id TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              sent_at INTEGER NOT NULL,
+              expires_at INTEGER NOT NULL
+            );
+          ''');
+          await txn.execute('CREATE INDEX IF NOT EXISTS idx_sent_history_expires ON sent_history(expires_at);');
+        },
+      ),
     ];
 
     await SchemaMigrator.migrate(
@@ -524,6 +554,24 @@ class DatabaseService {
       limit: 1,
     );
     return res.isNotEmpty;
+  }
+
+  /// Returns persisted processed packet IDs for anti-entropy summaries.
+  /// Expired IDs are excluded so the summary does not grow forever.
+  Future<List<String>> getProcessedPacketIds({
+    int? limit,
+    int? notExpiredAfter,
+  }) async {
+    final db = await database;
+    final rows = await db.query(
+      'processed_packets',
+      columns: ['packet_id'],
+      where: notExpiredAfter != null ? 'expires_at >= ?' : null,
+      whereArgs: notExpiredAfter != null ? [notExpiredAfter] : null,
+      orderBy: 'first_seen_at DESC',
+      limit: limit,
+    );
+    return rows.map((row) => row['packet_id'] as String).toList();
   }
 
   /// Atomically claims a packet_id in SQLite processed_packets table.

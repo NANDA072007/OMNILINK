@@ -197,6 +197,87 @@ class RoutingDatabaseService {
     return maps.map((m) => QueuedPacket.fromMap(m)).toList();
   }
 
+  Future<QueuedPacket?> getQueuedPacketById(String packetId) async {
+    final db = await database;
+    final maps = await db.query(
+      'outbox_queue',
+      where: 'packet_id = ?',
+      whereArgs: [packetId],
+      limit: 1,
+    );
+    return maps.isEmpty ? null : QueuedPacket.fromMap(maps.first);
+  }
+
+  // ===========================================================================
+  // 4b. SENT-HISTORY RETENTION (ANTI-ENTROPY RESEND)
+  // ===========================================================================
+
+  /// Stores a delivered packet so a peer can still request it after the
+  /// outbox row has been removed by a verified receipt.
+  Future<void> insertSentPacket({
+    required String packetId,
+    required String recipientNodeId,
+    required String payload,
+    required int sentAtMs,
+    required int expiresAtMs,
+  }) async {
+    final db = await database;
+    await db.insert(
+      'sent_history',
+      {
+        'packet_id': packetId,
+        'recipient_node_id': recipientNodeId,
+        'payload': payload,
+        'sent_at': sentAtMs,
+        'expires_at': expiresAtMs,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<String>> getSentPacketIds({
+    int limit = 10000,
+    int? notExpiredAfter,
+  }) async {
+    final db = await database;
+    final maps = await db.query(
+      'sent_history',
+      columns: ['packet_id'],
+      where: notExpiredAfter != null ? 'expires_at >= ?' : null,
+      whereArgs: notExpiredAfter != null ? [notExpiredAfter] : null,
+      orderBy: 'sent_at DESC',
+      limit: limit,
+    );
+    return maps.map((m) => m['packet_id'] as String).toList();
+  }
+
+  Future<Map<String, String>> getSentPacketPayloadsByIds(
+    List<String> packetIds,
+  ) async {
+    if (packetIds.isEmpty) return const {};
+    final db = await database;
+    final placeholders = List.filled(packetIds.length, '?').join(',');
+    final maps = await db.query(
+      'sent_history',
+      columns: ['packet_id', 'payload'],
+      where: 'packet_id IN ($placeholders)',
+      whereArgs: packetIds,
+    );
+    return {
+      for (final row in maps)
+        row['packet_id'] as String: row['payload'] as String,
+    };
+  }
+
+  Future<int> purgeExpiredSentHistory(int currentTimestampMs) async {
+    final db = await database;
+    return db.delete(
+      'sent_history',
+      where: 'expires_at < ?',
+      whereArgs: [currentTimestampMs],
+    );
+  }
+
   Future<List<QueuedPacket>> getPendingOutboxPackets() async {
     final db = await database;
     final maps = await db.query(

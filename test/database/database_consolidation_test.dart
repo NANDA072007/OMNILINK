@@ -42,7 +42,7 @@ void main() {
       await DatabaseService.instance.close();
     });
 
-    test('1. Fresh installation initializes single omnilink_mesh.db at v5 with all 10 unified tables', () async {
+    test('1. Fresh installation initializes single omnilink_mesh.db at v7 with all 11 unified tables', () async {
       final dbService = DatabaseService();
       final db = await dbService.database;
 
@@ -55,13 +55,14 @@ void main() {
       expect(tableNames.contains('payload_transfers'), isTrue);
       expect(tableNames.contains('payload_chunks'), isTrue);
       expect(tableNames.contains('processed_packets'), isTrue);
+      expect(tableNames.contains('sent_history'), isTrue);
       expect(tableNames.contains('routing_table'), isTrue);
       expect(tableNames.contains('neighbor_table'), isTrue);
       expect(tableNames.contains('encounter_history'), isTrue);
       expect(tableNames.contains('route_cache'), isTrue);
 
       final versionRes = await db.rawQuery('PRAGMA user_version;');
-      expect(versionRes.first['user_version'], equals(6));
+      expect(versionRes.first['user_version'], equals(7));
     });
 
     test('2 & 13. RoutingDatabaseService acts as facade and resolves to DatabaseService (omnilink_mesh.db)', () async {

@@ -143,6 +143,7 @@ void main() {
         getStaticX25519KeyPair: () => localStaticX25519,
         getConnectedPeers: () => connectedPeers,
         messageRepo: messageRepo,
+        receiptThrottle: Duration.zero,
       );
     });
 
@@ -268,12 +269,49 @@ void main() {
       final afterReceipt = await messageRepo.getMessagesForConversation(remoteNodeId);
       expect(afterReceipt.single.state, MessageState.receiptReceived);
 
+      final sentHistory = await routingDb.getSentPacketPayloadsByIds(
+        [message.messageId],
+      );
+      expect(
+        sentHistory,
+        contains(message.messageId),
+        reason: 'Delivered packets must remain resendable until expiry.',
+      );
+
       // A replayed receipt must be harmless and keep the row deleted.
       transport.emitIncoming('EP_REMOTE', receipt.toJson());
       await Future.delayed(const Duration(milliseconds: 200));
       expect(await routingDb.getAllQueuedPackets(), isEmpty);
       final afterReplay = await messageRepo.getMessagesForConversation(remoteNodeId);
       expect(afterReplay.single.state, MessageState.receiptReceived);
+      expect(
+        (await routingDb.getSentPacketIds())
+            .where((id) => id == message.messageId)
+            .length,
+        1,
+      );
+    });
+
+    test('persistent processed IDs survive a new PacketService instance', () async {
+      final envelope = await packetService.createEncryptedMessageEnvelope(
+        senderNodeId: localNodeId,
+        senderKeyPair: localEd25519,
+        senderStaticX25519KeyPair: localStaticX25519,
+        recipientNodeId: remoteNodeId,
+        recipientStaticX25519PublicKeyHex: remoteStaticX25519Hex,
+        plaintextBody: 'persist me',
+        packetId: 'pkt_persist_1',
+      );
+
+      await packetService.validateAndClaimEnvelope(envelope);
+
+      // Simulate an app restart: a new PacketService has an empty RAM cache.
+      final restartedService = PacketService(
+        cryptoService: cryptoService,
+        dbService: dbService,
+      );
+      final ids = await restartedService.getProcessedPacketIdsFromStore();
+      expect(ids, contains('pkt_persist_1'));
     });
 
     test('a duplicate inbound message re-sends the delivery receipt', () async {

@@ -324,6 +324,25 @@ class PacketService {
     return Set.unmodifiable(_processedPacketIds);
   }
 
+  /// Returns the RAM replay cache merged with the persistent SQLite replay
+  /// table. Anti-entropy must use this: the RAM cache is empty after restart.
+  Future<Set<String>> getProcessedPacketIdsFromStore({int limit = 10000}) async {
+    final ids = <String>{..._processedPacketIds};
+    final dbService = _dbService;
+    if (dbService != null) {
+      try {
+        final persisted = await dbService.getProcessedPacketIds(
+          limit: limit,
+          notExpiredAfter: DateTime.now().millisecondsSinceEpoch,
+        );
+        ids.addAll(persisted);
+      } catch (_) {
+        // Fall back to the RAM cache if the replay table is unavailable.
+      }
+    }
+    return ids;
+  }
+
   /// Clears the in-memory deduplication cache.
   void clearDeduplicationCache() {
     _processedPacketIds.clear();

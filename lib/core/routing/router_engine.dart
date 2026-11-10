@@ -85,6 +85,8 @@ class RouterEngine {
 
   final Map<String, String> _peerIdToNodeId = {};
   final Map<String, String> _nodeIdToPeerId = {};
+  final Map<String, DateTime> _lastReceiptSentAt = {};
+  final Duration receiptThrottle;
   void Function(String peerId, String nodeId, String? staticX25519PublicKeyHex)? onPeerNodeIdDiscovered;
 
   final _localInboundController = StreamController<PacketEnvelope>.broadcast();
@@ -107,6 +109,7 @@ class RouterEngine {
     this.getSignedKeyBundle,
     required this.getConnectedPeers,
     MessageRepository? messageRepo,
+    this.receiptThrottle = const Duration(seconds: 5),
   }) : messageRepo = messageRepo ?? MessageRepository(dbService: DatabaseService.instance) {
     prophetEngine = ProphetEngine(db: db);
     routeProtocol = RouteProtocol(
@@ -645,6 +648,14 @@ class RouterEngine {
   // ===========================================================================
 
   Future<void> _sendDeliveryReceipt(PacketEnvelope original) async {
+    final now = DateTime.now();
+    final lastSent = _lastReceiptSentAt[original.packetId];
+    if (lastSent != null && now.difference(lastSent) < receiptThrottle) {
+      debugPrint('OMNILINK_ROUTER: Throttling duplicate receipt for ${original.packetId}');
+      return;
+    }
+    _lastReceiptSentAt[original.packetId] = now;
+
     final myNodeId = getMyNodeId();
     final masterKeyPair = getMasterKeyPair?.call();
     if (myNodeId.isEmpty || masterKeyPair == null) {
@@ -830,6 +841,8 @@ class RouterEngine {
   Future<void> _periodicMaintenance() async {
     if (_isDisposed) return;
     debugPrint('OMNILINK_ROUTER: Running 30s periodic maintenance...');
+    final receiptCutoff = DateTime.now().subtract(const Duration(minutes: 5));
+    _lastReceiptSentAt.removeWhere((_, sentAt) => sentAt.isBefore(receiptCutoff));
     await prophetEngine.decayProbabilities();
 
     final connectedPeers = getConnectedPeers()
