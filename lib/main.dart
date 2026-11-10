@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'core/providers.dart';
+import 'transport_bridge/android_transport_adapter.dart';
 import 'ui/screens/contacts_screen.dart';
 
 void main() {
@@ -12,8 +16,36 @@ void main() {
   );
 }
 
-class OmnilinkApp extends StatelessWidget {
+class OmnilinkApp extends ConsumerStatefulWidget {
   const OmnilinkApp({super.key});
+
+  @override
+  ConsumerState<OmnilinkApp> createState() => _OmnilinkAppState();
+}
+
+class _OmnilinkAppState extends ConsumerState<OmnilinkApp>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      final adapter = ref.read(transportAdapterProvider);
+      if (adapter is AndroidTransportAdapter) {
+        unawaited(adapter.resumeFromBackground());
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {

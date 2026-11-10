@@ -19,10 +19,13 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
-    <!-- Foreground Service Permissions (Android 14+ / API 34+) -->
+    <!-- Foreground Service, Wake Lock & Boot Permissions (Android 14+ / API 34+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="OMNILINK"
@@ -53,10 +56,16 @@
             android:foregroundServiceType="connectedDevice"
             android:exported="false" />
 
-        <service
-            android:name="org.omnilink.transport.OmnilinkMeshService"
-            android:foregroundServiceType="connectedDevice"
-            android:exported="false" />
+        <!-- BroadcastReceiver for system boot auto-restoration -->
+        <receiver
+            android:name="org.omnilink.transport.OmnilinkBootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
 
         <meta-data
             android:name="flutterEmbedding"

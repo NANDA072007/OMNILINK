@@ -78,14 +78,19 @@ class IncomingPacketEvent {
   /// Strict Rule: Native transport layer DOES NOT parse JSON payload contents.
   final Uint8List payloadBytes;
 
+  /// Native durable-spool row id, when the platform supports it. The core
+  /// engine acknowledges this id after the packet is durably accepted.
+  final int? spoolId;
+
   const IncomingPacketEvent({
     required this.senderPeerId,
     required this.payloadBytes,
+    this.spoolId,
   });
 
   @override
   String toString() {
-    return 'IncomingPacketEvent(from: $senderPeerId, bytes: ${payloadBytes.length})';
+    return 'IncomingPacketEvent(from: $senderPeerId, bytes: ${payloadBytes.length}, spoolId: $spoolId)';
   }
 }
 

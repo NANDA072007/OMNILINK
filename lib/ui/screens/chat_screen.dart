@@ -1,17 +1,27 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-
-import 'package:cryptography/cryptography.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
+import 'dart:io';
+import 'package:file_picker/file_picker.dart';
+import 'package:mime/mime.dart';
+import '../../core/database/database_service.dart';
 import '../../core/models/message.dart';
 import '../../core/models/packet_envelope.dart';
 import '../../core/models/peer_device.dart';
+import '../../core/protocol/chunk_payload_models.dart';
+import '../../core/protocol/packet_types.dart';
 import '../../core/providers.dart';
+import '../../core/segmentation/models/payload_transfer.dart';
+import '../../core/segmentation/payload_segmenter.dart';
+import '../../state/providers/transfer_providers.dart';
 import '../../transport_bridge/android_transport_adapter.dart';
+import '../widgets/qr_verification_sheet.dart';
+import '../widgets/safety_number_dialog.dart';
+import '../widgets/transfer_progress_bar.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String peerId;
@@ -33,11 +43,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final Uuid _uuid = const Uuid();
   StreamSubscription<PacketEnvelope>? _envelopeSubscription;
 
+  String? _cachedRemoteStaticX25519Key;
+
   @override
   void initState() {
     super.initState();
     _subscribeToIncomingEnvelopes();
     _sendInitialPing();
+    _loadPeerInfo();
+  }
+
+  Future<void> _loadPeerInfo() async {
+    try {
+      final peerRepo = ref.read(peerRepositoryProvider);
+      final resolvedNodeId = _resolveRemoteNodeId();
+      final peer = await peerRepo.getPeerByNodeId(resolvedNodeId);
+      if (peer?.staticX25519PublicKeyHex != null && mounted) {
+        setState(() {
+          _cachedRemoteStaticX25519Key = peer!.staticX25519PublicKeyHex;
+        });
+      }
+    } catch (_) {}
   }
 
   @override
@@ -55,11 +81,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     });
   }
 
+  bool _isSending = false;
+
   /// Resolves the remote peer's 64-character cryptographic nodeId from peerListProvider.
   String _resolveRemoteNodeId() {
     final activePeers = ref.read(peerListProvider);
     for (final p in activePeers) {
       if (p.peerId == widget.peerId && p.nodeId != null && p.nodeId!.isNotEmpty) {
+        // Auto-migrate transient peerId entries to permanent nodeId in SQLite
+        ref.read(messageRepositoryProvider).migrateConversationId(widget.peerId, p.nodeId!);
         return p.nodeId!;
       }
       if (p.nodeId == widget.peerId) {
@@ -69,16 +99,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     return widget.peerId;
   }
 
-  /// Derives symmetric SecretKey using deterministic, sorted node ID concatenation.
-  Future<SecretKey> _deriveSymmetricKey(String localNodeId, String remoteNodeId) async {
-    final cryptoService = ref.read(cryptoServiceProvider);
-    final sortedNodes = [localNodeId, remoteNodeId]..sort();
-    final keySeedInput = '${sortedNodes[0]}:${sortedNodes[1]}';
-    final keySeed = await cryptoService.sha256Hex(
-      Uint8List.fromList(utf8.encode(keySeedInput)),
-    );
-    debugPrint('OMNILINK_FIX: Derived symmetric key for sorted nodes: $keySeedInput');
-    return SecretKey(utf8.encode(keySeed.substring(0, 32)));
+  /// Resolves the native transport peerId (endpoint ID) for radio operations.
+  String _resolveTransportPeerId() {
+    final activePeers = ref.read(peerListProvider);
+    for (final p in activePeers) {
+      if (p.nodeId == widget.peerId || p.peerId == widget.peerId) {
+        return p.peerId;
+      }
+    }
+    return widget.peerId;
+  }
+
+  /// Resolves the remote peer's verified static X25519 encryption key from peerListProvider or database cache.
+  String? _resolveRemoteStaticX25519PublicKey() {
+    final activePeers = ref.read(peerListProvider);
+    final resolvedNodeId = _resolveRemoteNodeId();
+    for (final p in activePeers) {
+      if ((p.peerId == widget.peerId || p.nodeId == widget.peerId || p.nodeId == resolvedNodeId) &&
+          p.staticX25519PublicKeyHex != null &&
+          p.staticX25519PublicKeyHex!.isNotEmpty) {
+        return p.staticX25519PublicKeyHex;
+      }
+    }
+    return _cachedRemoteStaticX25519Key;
   }
 
   /// Listens to local inbound stream from the central RouterEngine.
@@ -89,143 +132,67 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   /// Processes pre-validated incoming envelopes routed specifically to this local device.
   Future<void> _handleIncomingEnvelope(PacketEnvelope envelope) async {
-    final tRecv = DateTime.now().millisecondsSinceEpoch;
-    debugPrint('OMNILINK_DART: [t=$tRecv] incoming packet senderPeerId=${envelope.senderId}');
-    debugPrint('OMNILINK_DART: [t=$tRecv] current chat peerId=${widget.peerId}');
-
     final resolvedRemoteNodeId = _resolveRemoteNodeId();
 
-    // Filter matching peer (allow prefix matching for Node ID / endpoint ID)
-    final isMatchingPeer = envelope.senderId == widget.peerId ||
-        envelope.senderId == resolvedRemoteNodeId ||
+    final isMatchingPeer = envelope.senderId == resolvedRemoteNodeId ||
+        envelope.recipientId == resolvedRemoteNodeId ||
+        envelope.senderId == widget.peerId ||
         envelope.senderId.startsWith(widget.peerId) ||
         widget.peerId.startsWith(envelope.senderId);
 
-    if (!isMatchingPeer) {
-      debugPrint('OMNILINK_DART: [t=$tRecv] ignored envelope because senderId (${envelope.senderId}) does not match current chat peerId (${widget.peerId}) or resolvedNodeId ($resolvedRemoteNodeId)');
-      return;
-    }
+    if (!isMatchingPeer) return;
 
-    try {
-      final messageRepo = ref.read(messageRepositoryProvider);
-
-      // Handle DELIVERY_RECEIPT
-      if (envelope.messageType == 'DELIVERY_RECEIPT') {
-        final originalPacketId = envelope.encryptedPayload;
-        debugPrint('OMNILINK_DART: [t=$tRecv] received DELIVERY_RECEIPT for packetId=$originalPacketId');
-        await messageRepo.updateMessageState(originalPacketId, MessageState.receiptReceived);
-        if (mounted) {
-          ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
-        }
-        return;
-      }
-
-      if (envelope.messageType == 'MESSAGE_PAYLOAD') {
-        final cryptoService = ref.read(cryptoServiceProvider);
-        // Derive symmetric key for payload decryption using deterministic sorted node IDs
-        final secretKey = await _deriveSymmetricKey(envelope.recipientId, envelope.senderId);
-
-        // Decrypt ChaCha20-Poly1305 payload
-        final decryptedBytes = await cryptoService.decryptPayload(
-          base64Payload: envelope.encryptedPayload,
-          secretKey: secretKey,
-        );
-        final decryptedText = utf8.decode(decryptedBytes);
-
-        final receivedMessage = Message(
-          messageId: envelope.packetId,
-          conversationId: widget.peerId,
-          senderNodeId: envelope.senderId,
-          recipientNodeId: envelope.recipientId,
-          plaintextBody: decryptedText,
-          state: MessageState.delivered,
-          createdAt: DateTime.fromMillisecondsSinceEpoch(envelope.createdAt),
-          updatedAt: DateTime.now(),
-        );
-
-        // 1. Save received message to SQLite database
-        await messageRepo.saveMessage(receivedMessage);
-        debugPrint('OMNILINK_DART: [t=$tRecv] message ${envelope.packetId} decrypted and saved to SQLite');
-
-        // 2. Send back DELIVERY_RECEIPT to sender
-        _sendDeliveryReceipt(envelope.senderId, envelope.packetId);
-
-        // 3. Trigger reactive update for this conversation thread
-        if (mounted) {
-          ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
-          _scrollToBottom();
-        }
-      }
-    } catch (e, s) {
-      debugPrint('OMNILINK_DART: [t=$tRecv] error handling incoming envelope: $e\n$s');
-    }
-  }
-
-  /// Sends cryptographic DELIVERY_RECEIPT back to message originator.
-  Future<void> _sendDeliveryReceipt(String recipientId, String messageId) async {
-    final t0 = DateTime.now().millisecondsSinceEpoch;
-    final identityState = ref.read(identityProvider);
-    final myNodeId = identityState.nodeId ?? 'unknown_node';
-
-    try {
-      final envelope = PacketEnvelope(
-        packetId: 'receipt_$messageId',
-        senderId: myNodeId,
-        recipientId: recipientId,
-        createdAt: t0,
-        expiresAt: t0 + 60000,
-        messageType: 'DELIVERY_RECEIPT',
-        payloadHash: 'receipt',
-        signature: 'receipt',
-        encryptedPayload: messageId,
-      );
-
-      final router = ref.read(routerEngineProvider);
-      await router.sendMessage(envelope);
-      debugPrint('OMNILINK_DART: [t=$t0] sent DELIVERY_RECEIPT for $messageId to $recipientId');
-    } catch (e) {
-      debugPrint('OMNILINK_DART: [t=$t0] failed to send DELIVERY_RECEIPT: $e');
+    if (mounted) {
+      ref.read(conversationMessagesProvider(resolvedRemoteNodeId).notifier).loadMessages();
+      ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
+      _scrollToBottom();
     }
   }
 
   Future<void> _sendMessage() async {
-    final t0 = DateTime.now().millisecondsSinceEpoch;
-    final text = _textController.text.trim();
-    if (text.isEmpty) return;
+    if (_isSending) return;
+    _isSending = true;
 
-    final identityState = ref.read(identityProvider);
-    final masterKeyPair = identityState.masterKeyPair;
-    final myNodeId = identityState.nodeId;
+    try {
+      final t0 = DateTime.now().millisecondsSinceEpoch;
+      final text = _textController.text.trim();
+      if (text.isEmpty) return;
 
-    if (masterKeyPair == null || myNodeId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Identity keypair not ready yet.')),
-      );
-      return;
-    }
+      final identityState = ref.read(identityProvider);
+      final masterKeyPair = identityState.masterKeyPair;
+      final myNodeId = identityState.nodeId;
 
-    final daemon = ref.read(outboxDaemonProvider);
-    final messageId = _uuid.v4();
-    final messageRepo = ref.read(messageRepositoryProvider);
+      if (masterKeyPair == null || myNodeId == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Identity keypair not ready yet.')),
+        );
+        return;
+      }
+
+      final daemon = ref.read(outboxDaemonProvider);
+      final messageId = _uuid.v4();
+      final messageRepo = ref.read(messageRepositoryProvider);
+
+      final resolvedRemoteNodeId = _resolveRemoteNodeId();
 
     final connectedPeers = ref.read(peerListProvider)
         .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
         .toList();
 
     final isDirectlyConnected = connectedPeers.any(
-      (p) => p.nodeId == widget.peerId || p.peerId == widget.peerId,
+      (p) => p.nodeId == resolvedRemoteNodeId || p.peerId == widget.peerId || p.nodeId == widget.peerId,
     );
 
     final initialState = isDirectlyConnected ? MessageState.sending : MessageState.queued;
 
-    debugPrint('OMNILINK_SEND: User tapped send for ${widget.peerId}');
+    debugPrint('OMNILINK_SEND: User tapped send for $resolvedRemoteNodeId');
 
     // 1. INSTANT LOCAL SAVE & UI REFRESH (< 20ms execution)
     final draftMessage = Message(
       messageId: messageId,
-      conversationId: widget.peerId,
+      conversationId: resolvedRemoteNodeId,
       senderNodeId: myNodeId,
-      recipientNodeId: widget.peerId,
+      recipientNodeId: resolvedRemoteNodeId,
       plaintextBody: text,
       state: initialState,
       createdAt: DateTime.now(),
@@ -234,6 +201,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     await messageRepo.saveMessage(draftMessage);
     _textController.clear();
+    ref.read(conversationMessagesProvider(resolvedRemoteNodeId).notifier).loadMessages();
     ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
     _scrollToBottom();
 
@@ -244,26 +212,46 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       try {
         final packetService = ref.read(packetServiceProvider);
         final resolvedRemoteNodeId = _resolveRemoteNodeId();
+        final staticKeyPair = identityState.staticX25519KeyPair;
+        final recipientStaticX25519Hex = _resolveRemoteStaticX25519PublicKey();
 
-        final secretKey = await _deriveSymmetricKey(myNodeId, resolvedRemoteNodeId);
+        if (recipientStaticX25519Hex == null) {
+          // Trigger route advertisement to request remote key bundle over active transport
+          final transportPeerId = _resolveTransportPeerId();
+          if (transportPeerId.isNotEmpty) {
+            ref.read(routerEngineProvider).routeProtocol.sendRouteAdvertisement(transportPeerId);
+          }
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Exchanging security keys with peer... Message queued.'),
+              ),
+            );
+          }
+          return;
+        }
 
-        final cryptoService = ref.read(cryptoServiceProvider);
-        final encryptedPayloadBase64 = await cryptoService.encryptPayload(
-          plaintext: Uint8List.fromList(utf8.encode(text)),
-          secretKey: secretKey,
-        );
-
-        final envelope = await packetService.createEnvelope(
+        final envelope = await packetService.createEncryptedMessageEnvelope(
           senderNodeId: myNodeId,
-          recipientNodeId: resolvedRemoteNodeId,
-          messageType: 'MESSAGE_PAYLOAD',
-          encryptedPayloadBase64: encryptedPayloadBase64,
           senderKeyPair: masterKeyPair,
+          senderStaticX25519KeyPair: staticKeyPair!,
+          recipientNodeId: resolvedRemoteNodeId,
+          recipientStaticX25519PublicKeyHex: recipientStaticX25519Hex,
+          plaintextBody: text,
+          packetId: messageId,
         );
 
         // Pass envelope to central RouterEngine for 5-layer route selection & transmission
         final routerEngine = ref.read(routerEngineProvider);
         await routerEngine.sendMessage(envelope);
+        unawaited(routerEngine.outboxDaemon.flushAll());
+
+        // Refresh UI state after fast flush attempt
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (mounted) {
+          ref.read(conversationMessagesProvider(resolvedRemoteNodeId).notifier).loadMessages();
+          ref.read(conversationMessagesProvider(widget.peerId).notifier).loadMessages();
+        }
 
         final adapter = ref.read(transportAdapterProvider);
         final usageMap = (adapter is AndroidTransportAdapter)
@@ -308,6 +296,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         debugPrint('OMNILINK_UI: Exception during background outbox queueing: $e');
       }
     }());
+    } finally {
+      _isSending = false;
+    }
   }
 
   void _scrollToBottom() {
@@ -360,7 +351,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     final identityState = ref.watch(identityProvider);
-    final messages = ref.watch(conversationMessagesProvider(widget.peerId));
+    final effectiveId = _resolveRemoteNodeId();
+    final messages = ref.watch(conversationMessagesProvider(effectiveId));
 
     final myNodeId = identityState.nodeId;
     final titleName = widget.peerName ?? widget.peerId;
@@ -377,6 +369,45 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             ),
           ],
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.shield_outlined, color: Color(0xFF00E676)),
+            tooltip: 'Safety Number & Identity Verification',
+            onPressed: () {
+              final myNodeId = identityState.nodeId;
+              if (myNodeId != null) {
+                showDialog(
+                  context: context,
+                  builder: (_) => SafetyNumberDialog(
+                    peerName: titleName,
+                    localNodeId: myNodeId,
+                    remoteNodeId: effectiveId,
+                    onStateChanged: () => setState(() {}),
+                  ),
+                );
+              }
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.qr_code_scanner_rounded, color: Color(0xFF00E676)),
+            tooltip: 'QR Code Verification',
+            onPressed: () {
+              final myNodeId = identityState.nodeId;
+              if (myNodeId != null) {
+                showModalBottomSheet(
+                  context: context,
+                  isScrollControlled: true,
+                  builder: (_) => QrVerificationSheet(
+                    peerName: titleName,
+                    localNodeId: myNodeId,
+                    remoteNodeId: effectiveId,
+                    onStateChanged: () => setState(() {}),
+                  ),
+                );
+              }
+            },
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -469,12 +500,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     },
                   ),
           ),
+          Consumer(
+            builder: (context, ref, child) {
+              final activeTransfers = ref.watch(activeTransfersProvider);
+              if (activeTransfers.isEmpty) return const SizedBox.shrink();
+
+              return Column(
+                children: activeTransfers.values
+                    .map((p) => TransferProgressBar(progress: p, peerId: widget.peerId))
+                    .toList(),
+              );
+            },
+          ),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             color: const Color(0xFF161616),
             child: SafeArea(
               child: Row(
                 children: [
+                  IconButton(
+                    icon: const Icon(Icons.attach_file_rounded, color: Color(0xFF00E676)),
+                    tooltip: 'Send Media / File',
+                    onPressed: _pickAndSendFile,
+                  ),
                   Expanded(
                     child: TextField(
                       controller: _textController,
@@ -511,5 +559,95 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         ],
       ),
     );
+  }
+
+  Future<void> _pickAndSendFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        allowMultiple: false,
+        type: FileType.any,
+      );
+
+      if (result == null || result.files.isEmpty || result.files.first.path == null) {
+        return;
+      }
+
+      final filePath = result.files.first.path!;
+      final file = File(filePath);
+      if (!await file.exists()) return;
+
+      final fileName = result.files.first.name;
+      final fileSize = await file.length();
+      final mimeType = lookupMimeType(filePath) ?? 'application/octet-stream';
+
+      final segmenter = PayloadSegmenter();
+      final finalSha256 = await segmenter.calculateFinalSha256(filePath);
+
+      final payloadId = 'pld_${DateTime.now().millisecondsSinceEpoch}_${_uuid.v4().substring(0, 8)}';
+      final totalChunks = (fileSize / PayloadSegmenter.defaultMaxChunkSize).ceil();
+      final myNodeId = ref.read(identityProvider).nodeId ?? '';
+      final remoteNodeId = _resolveRemoteNodeId();
+
+      final offerPayload = TransferOfferPayload(
+        payloadId: payloadId,
+        fileName: fileName,
+        mimeType: mimeType,
+        totalSize: fileSize,
+        totalChunks: totalChunks,
+        finalSha256: finalSha256,
+      );
+
+      final offerEnvelopeJson = jsonEncode({
+        'packet_id': 'off_$payloadId',
+        'sender_id': myNodeId,
+        'recipient_id': remoteNodeId,
+        'message_type': PacketTypeNames.transferOffer,
+        'encrypted_payload': offerPayload.toJson(),
+      });
+
+      final transferRecord = PayloadTransfer(
+        payloadId: payloadId,
+        direction: TransferDirection.outgoing,
+        senderNodeId: myNodeId,
+        recipientNodeId: remoteNodeId,
+        fileName: fileName,
+        payloadType: mimeType.split('/').first,
+        mimeType: mimeType,
+        totalSize: fileSize,
+        totalChunks: totalChunks,
+        receivedChunks: 0,
+        finalSha256: finalSha256,
+        transferState: TransferState.pending,
+        localFilePath: filePath,
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
+      );
+
+      final db = DatabaseService.instance;
+      await db.insert('payload_transfers', transferRecord.toMap());
+
+      final router = ref.read(routerEngineProvider);
+      final sendQueueManager = router.sendQueueManager;
+      await sendQueueManager.enqueueAndSend(
+        packetId: 'off_$payloadId',
+        peerId: widget.peerId,
+        payloadBytes: Uint8List.fromList(utf8.encode(offerEnvelopeJson)),
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Transfer offer sent for $fileName ($totalChunks chunks)'),
+            backgroundColor: const Color(0xFF00E676),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('File selection failed: $e'), backgroundColor: Colors.redAccent),
+        );
+      }
+    }
   }
 }

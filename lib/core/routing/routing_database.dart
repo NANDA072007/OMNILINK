@@ -1,118 +1,23 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
-import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
+import '../database/database_service.dart';
+import '../diagnostics/app_logger.dart';
 import 'models/encounter_record.dart';
 import 'models/neighbor_info.dart';
 import 'models/queued_packet.dart';
 import 'models/route_entry.dart';
 
-/// SQLite Database Service managing persistence for the OMNILINK Intelligent Routing Engine.
+/// Compatibility Facade for Routing operations, forwarding to authoritative [DatabaseService] (omnilink_mesh.db).
 class RoutingDatabaseService {
-  static const String _dbName = 'omnilink_routing.db';
-  static const int _dbVersion = 1;
-
   static final RoutingDatabaseService instance = RoutingDatabaseService._internal();
-  static Database? _database;
 
   RoutingDatabaseService._internal();
 
   factory RoutingDatabaseService() => instance;
 
   Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDatabase();
-    return _database!;
-  }
-
-  Future<Database> _initDatabase() async {
-    final dbPath = await getDatabasesPath();
-    final path = join(dbPath, _dbName);
-
-    return await openDatabase(
-      path,
-      version: _dbVersion,
-      onCreate: _onCreate,
-    );
-  }
-
-  /// Initial table creation schema for routing structures.
-  Future<void> _onCreate(Database db, int version) async {
-    // 1. Routing Table
-    await db.execute('''
-      CREATE TABLE routing_table (
-        destination_node_id TEXT PRIMARY KEY,
-        next_hop_peer_id TEXT NOT NULL,
-        next_hop_node_id TEXT,
-        hop_count INTEGER NOT NULL DEFAULT 1,
-        probability REAL NOT NULL DEFAULT 1.0,
-        signal_quality REAL NOT NULL DEFAULT 0.5,
-        last_updated INTEGER NOT NULL,
-        last_successful_delivery INTEGER,
-        delivery_attempts INTEGER NOT NULL DEFAULT 0,
-        delivery_successes INTEGER NOT NULL DEFAULT 0,
-        is_active INTEGER NOT NULL DEFAULT 1
-      )
-    ''');
-
-    // 2. Neighbor Table
-    await db.execute('''
-      CREATE TABLE neighbor_table (
-        peer_id TEXT PRIMARY KEY,
-        node_id TEXT,
-        friendly_name TEXT NOT NULL,
-        rssi INTEGER,
-        link_quality REAL NOT NULL DEFAULT 0.5,
-        first_seen INTEGER NOT NULL,
-        last_seen INTEGER NOT NULL,
-        is_connected INTEGER NOT NULL DEFAULT 1,
-        packets_sent INTEGER NOT NULL DEFAULT 0,
-        packets_received INTEGER NOT NULL DEFAULT 0,
-        packets_failed INTEGER NOT NULL DEFAULT 0
-      )
-    ''');
-
-    // 3. Encounter History Table
-    await db.execute('''
-      CREATE TABLE encounter_history (
-        node_id TEXT PRIMARY KEY,
-        peer_id TEXT NOT NULL,
-        predictability REAL NOT NULL DEFAULT 0.75,
-        encounter_count INTEGER NOT NULL DEFAULT 1,
-        last_encounter INTEGER NOT NULL,
-        first_encounter INTEGER NOT NULL,
-        avg_duration_seconds REAL NOT NULL DEFAULT 0.0
-      )
-    ''');
-
-    // 4. Outbox Queue Table
-    await db.execute('''
-      CREATE TABLE outbox_queue (
-        packet_id TEXT PRIMARY KEY,
-        sender_node_id TEXT NOT NULL,
-        recipient_node_id TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        priority TEXT NOT NULL,
-        strategy TEXT NOT NULL,
-        ttl INTEGER NOT NULL,
-        hop_count INTEGER NOT NULL,
-        created_at INTEGER NOT NULL,
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        next_retry_at INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending'
-      )
-    ''');
-
-    // 5. Route Cache Table
-    await db.execute('''
-      CREATE TABLE route_cache (
-        destination_node_id TEXT PRIMARY KEY,
-        next_hop_peer_id TEXT NOT NULL,
-        path_json TEXT,
-        cached_at INTEGER NOT NULL
-      )
-    ''');
+    return DatabaseService.instance.database;
   }
 
   // ===========================================================================
@@ -261,7 +166,7 @@ class RoutingDatabaseService {
       );
     }
     await batch.commit(noResult: true);
-    debugPrint('OMNILINK_ROUTING_DB: Applied PRoPHET decay to ${all.length} encounter records.');
+    AppLogger.info('Applied PRoPHET decay to ${all.length} encounter records.', domain: LogDomain.routing);
   }
 
   Future<void> deleteEncounter(String nodeId) async {
@@ -274,7 +179,7 @@ class RoutingDatabaseService {
   }
 
   // ===========================================================================
-  // 4. OUTBOX QUEUE CRUD & QUERIES
+  // 4. OUTBOX QUEUE CRUD & BATCHED DELETION
   // ===========================================================================
 
   Future<void> insertOrUpdateQueuedPacket(QueuedPacket packet) async {
@@ -296,13 +201,92 @@ class RoutingDatabaseService {
     final db = await database;
     final maps = await db.query(
       'outbox_queue',
-      where: 'status = ?',
-      whereArgs: ['pending'],
+      where: 'status = ? OR status = ?',
+      whereArgs: ['pending', 'sending'],
     );
     final packets = maps.map((m) => QueuedPacket.fromMap(m)).toList();
-    // Sort in-memory by urgency score descending
     packets.sort((a, b) => b.urgencyScore.compareTo(a.urgencyScore));
     return packets;
+  }
+
+  /// Returns packets whose retry or lease deadline has elapsed.
+  ///
+  /// This is the only query the flusher uses for transmission. Reading the
+  /// outbox must never mutate state; the previous unconditional
+  /// `sending -> pending` reset allowed concurrent flushes to double-send.
+  Future<List<QueuedPacket>> getDueOutboxPackets(DateTime now) async {
+    final db = await database;
+    final maps = await db.query(
+      'outbox_queue',
+      where: "status IN ('pending', 'sending') AND next_retry_at <= ?",
+      whereArgs: [now.millisecondsSinceEpoch],
+    );
+    final packets = maps.map((m) => QueuedPacket.fromMap(m)).toList();
+    packets.sort((a, b) => b.urgencyScore.compareTo(a.urgencyScore));
+    return packets;
+  }
+
+  /// Claims packets for one transmission attempt. `next_retry_at` is reused as
+  /// a lease deadline so a crash cannot leave rows stuck in 'sending' forever.
+  Future<int> claimOutboxPackets(List<String> ids, DateTime leaseUntil) {
+    return _batchUpdateOutbox(
+      ids,
+      status: 'sending',
+      nextRetryAt: leaseUntil,
+    );
+  }
+
+  /// Marks link-acked packets as awaiting an end-to-end delivery receipt.
+  Future<int> markOutboxPacketsAwaitingReceipt(
+    List<String> ids,
+    DateTime nextRetryAt,
+  ) {
+    return _batchUpdateOutbox(
+      ids,
+      status: 'pending',
+      nextRetryAt: nextRetryAt,
+    );
+  }
+
+  Future<int> markOutboxPacketAwaitingReceipt(
+    String id,
+    DateTime nextRetryAt,
+  ) async {
+    final db = await database;
+    return db.update(
+      'outbox_queue',
+      {
+        'status': 'pending',
+        'next_retry_at': nextRetryAt.millisecondsSinceEpoch,
+      },
+      where: 'packet_id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<int> _batchUpdateOutbox(
+    List<String> ids, {
+    required String status,
+    required DateTime nextRetryAt,
+  }) async {
+    if (ids.isEmpty) return 0;
+    final db = await database;
+    return db.transaction((txn) async {
+      final batch = txn.batch();
+      for (final id in ids) {
+        batch.update(
+          'outbox_queue',
+          {
+            'status': status,
+            'next_retry_at': nextRetryAt.millisecondsSinceEpoch,
+          },
+          where: 'packet_id = ?',
+          whereArgs: [id],
+        );
+      }
+      final results = await batch.commit();
+      return results.length;
+    });
   }
 
   Future<void> deleteQueuedPacket(String packetId) async {
@@ -311,6 +295,86 @@ class RoutingDatabaseService {
       'outbox_queue',
       where: 'packet_id = ?',
       whereArgs: [packetId],
+    );
+  }
+
+  /// Atomic batch deletion of multiple outbox packets inside a single SQLite transaction.
+  Future<int> deleteQueuedPacketsByIds(List<String> ids) async {
+    if (ids.isEmpty) return 0;
+    final db = await database;
+    final stopwatch = Stopwatch()..start();
+
+    final count = await db.transaction((txn) async {
+      final batch = txn.batch();
+      for (final id in ids) {
+        batch.delete(
+          'outbox_queue',
+          where: 'packet_id = ?',
+          whereArgs: [id],
+        );
+      }
+      final results = await batch.commit();
+      return results.length;
+    });
+
+    stopwatch.stop();
+    AppLogger.info(
+      'Atomic batch deleted ${ids.length} outbox packets in ${stopwatch.elapsedMilliseconds}ms',
+      domain: LogDomain.db,
+    );
+    return count;
+  }
+
+  /// Atomic batch status update for multiple outbox packets.
+  Future<int> markPacketsStatus(List<String> ids, String status) async {
+    if (ids.isEmpty) return 0;
+    final db = await database;
+    final stopwatch = Stopwatch()..start();
+
+    final count = await db.transaction((txn) async {
+      final batch = txn.batch();
+      for (final id in ids) {
+        batch.update(
+          'outbox_queue',
+          {'status': status},
+          where: 'packet_id = ?',
+          whereArgs: [id],
+        );
+      }
+      final results = await batch.commit();
+      return results.length;
+    });
+
+    stopwatch.stop();
+    AppLogger.info(
+      'Atomic batch marked ${ids.length} outbox packets status=$status in ${stopwatch.elapsedMilliseconds}ms',
+      domain: LogDomain.db,
+    );
+    return count;
+  }
+
+  /// Atomic batch update for multiple queued packets (e.g. exponential backoff updates).
+  Future<void> batchUpdateQueuedPackets(List<QueuedPacket> packets) async {
+    if (packets.isEmpty) return;
+    final db = await database;
+    final stopwatch = Stopwatch()..start();
+
+    await db.transaction((txn) async {
+      final batch = txn.batch();
+      for (final packet in packets) {
+        batch.insert(
+          'outbox_queue',
+          packet.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+
+    stopwatch.stop();
+    AppLogger.info(
+      'Atomic batch updated ${packets.length} outbox packets in ${stopwatch.elapsedMilliseconds}ms',
+      domain: LogDomain.db,
     );
   }
 
@@ -330,5 +394,9 @@ class RoutingDatabaseService {
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+  }
+
+  Future<void> close() async {
+    await DatabaseService.instance.close();
   }
 }

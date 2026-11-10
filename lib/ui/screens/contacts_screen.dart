@@ -20,7 +20,6 @@ class ContactsScreen extends ConsumerStatefulWidget {
 
 class _ContactsScreenState extends ConsumerState<ContactsScreen> {
   List<PeerDevice> _savedPeers = [];
-  bool _isLoading = true;
 
   @override
   void initState() {
@@ -29,18 +28,25 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
   }
 
   Future<void> _loadContactsFromDb() async {
-    final peerRepo = ref.read(peerRepositoryProvider);
-    final peers = await peerRepo.getAllPeers();
-    if (mounted) {
-      setState(() {
-        _savedPeers = peers;
-        _isLoading = false;
-      });
+    try {
+      final peerRepo = ref.read(peerRepositoryProvider);
+      final peers = await peerRepo.getAllPeers();
+      if (mounted) {
+        setState(() {
+          _savedPeers = peers;
+        });
+      }
+    } catch (e) {
+      debugPrint('OMNILINK_UI: Error loading contacts: $e');
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    ref.listen(peerListProvider, (_, __) {
+      _loadContactsFromDb();
+    });
+
     final identityState = ref.watch(identityProvider);
     final activePeerList = ref.watch(peerListProvider);
 
@@ -53,11 +59,24 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
     final Map<String, PeerDevice> mergedContacts = {};
 
     for (final saved in _savedPeers) {
-      mergedContacts[saved.peerId] = saved;
+      final key = (saved.nodeId != null && saved.nodeId!.isNotEmpty) ? saved.nodeId! : saved.peerId;
+      mergedContacts[key] = saved;
     }
 
     for (final active in activePeerList) {
-      mergedContacts[active.peerId] = active;
+      final key = (active.nodeId != null && active.nodeId!.isNotEmpty) ? active.nodeId! : active.peerId;
+      final existing = mergedContacts[key];
+      if (existing != null) {
+        mergedContacts[key] = existing.copyWith(
+          connectionStatus: active.connectionStatus,
+          peerId: active.peerId,
+          nodeId: active.nodeId ?? existing.nodeId,
+          friendlyName: active.friendlyName.isNotEmpty ? active.friendlyName : existing.friendlyName,
+          staticX25519PublicKeyHex: active.staticX25519PublicKeyHex ?? existing.staticX25519PublicKeyHex,
+        );
+      } else {
+        mergedContacts[key] = active;
+      }
     }
 
     final contactsList = mergedContacts.values.toList();
@@ -119,11 +138,7 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
           ),
         ],
       ),
-      body: _isLoading
-          ? const Center(
-              child: CircularProgressIndicator(color: Color(0xFF00E676)),
-            )
-          : contactsList.isEmpty
+      body: contactsList.isEmpty
               ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -179,11 +194,15 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
 
                       final statusColor = isDirectlyConnected
                           ? const Color(0xFF00E676) // Green: Directly connected
-                          : Colors.amber; // Yellow: Offline / Multi-hop mesh
+                          : Colors.grey; // Grey: Offline
 
                       final statusText = isDirectlyConnected
                           ? 'Online • Direct Radio Link'
                           : 'Offline • Store & Forward Mesh';
+
+                      final targetId = (peer.nodeId != null && peer.nodeId!.isNotEmpty)
+                          ? peer.nodeId!
+                          : peer.peerId;
 
                       return Card(
                         margin: const EdgeInsets.only(bottom: 10),
@@ -228,7 +247,7 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
                             style: const TextStyle(fontWeight: FontWeight.bold),
                           ),
                           subtitle: Text(
-                            'ID: ${peer.peerId}\n$statusText',
+                            'ID: $targetId\n$statusText',
                             style: const TextStyle(fontSize: 12, color: Colors.grey),
                           ),
                           isThreeLine: true,
@@ -241,7 +260,7 @@ class _ContactsScreenState extends ConsumerState<ContactsScreen> {
                               context,
                               MaterialPageRoute(
                                 builder: (_) => ChatScreen(
-                                  peerId: peer.peerId,
+                                  peerId: targetId,
                                   peerName: peer.friendlyName,
                                 ),
                               ),

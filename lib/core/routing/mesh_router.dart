@@ -59,17 +59,15 @@ class MeshRouter {
         'OMNILINK_ROUTER: [t=$tRecv] envelope packetId=${envelope.packetId} type=${envelope.messageType} sender=${envelope.senderId.substring(0, 8)}... recipient=${envelope.recipientId.substring(0, 8)}...',
       );
 
-      // 1. Check LRU deduplication cache (Rule #5: Prevent infinite routing loops)
-      if (_packetService.isDuplicate(envelope.packetId)) {
-        debugPrint('OMNILINK_EPIDEMIC: [t=$tRecv] DROPPING duplicate packet ${envelope.packetId}');
-        return;
-      }
-      _packetService.markProcessed(envelope.packetId);
-
-      // 2. Validate envelope Ed25519 signature
-      final isValid = await _packetService.validateEnvelope(envelope);
-      if (!isValid) {
-        debugPrint('OMNILINK_ROUTER: [t=$tRecv] DROPPING packet ${envelope.packetId}: Invalid signature');
+      // 1. Structural, timestamp, Ed25519 signature validation & atomic replay claim
+      try {
+        final isValid = await _packetService.validateAndClaimEnvelope(envelope);
+        if (!isValid) {
+          debugPrint('OMNILINK_ROUTER: [t=$tRecv] DROPPING packet ${envelope.packetId}: Invalid signature');
+          return;
+        }
+      } on PacketValidationException catch (e) {
+        debugPrint('OMNILINK_ROUTER: [t=$tRecv] DROPPING packet ${envelope.packetId}: ${e.errorCode} - ${e.message}');
         return;
       }
 

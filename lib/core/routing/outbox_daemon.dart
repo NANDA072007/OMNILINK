@@ -1,20 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'package:flutter/foundation.dart';
+import 'package:collection/collection.dart';
 
 import '../../transport_bridge/transport_adapter.dart';
+import '../diagnostics/app_logger.dart';
+import '../diagnostics/metrics_service.dart';
 import '../models/message.dart';
 import '../models/packet_envelope.dart';
 import '../models/peer_device.dart';
 import '../repositories/message_repository.dart';
+import '../repositories/peer_repository.dart';
+import '../database/database_service.dart';
 import 'models/queued_packet.dart';
 import 'router_engine.dart' hide RouteStrategy;
 import 'routing_database.dart';
 
 /// Store-and-Forward Daemon managing persistent message outbox queues in SQLite.
 /// Guarantees eventual message delivery across mesh disruptions with priority queueing,
-/// automatic peer-connection flushes, TTL expiration, and exponential backoff retries.
+/// atomic batch flushes, idempotent lock flags, and MetricsService telemetry.
 class OutboxDaemon {
   final RoutingDatabaseService db;
   final TransportAdapter transport;
@@ -22,9 +26,12 @@ class OutboxDaemon {
   final MessageRepository messageRepo;
   final List<PeerDevice> Function() getConnectedPeers;
 
-  StreamSubscription<PeerConnectionEvent>? _peerSub;
   Timer? _maintenanceTimer;
   final Set<String> _flushingPeerIds = {};
+
+  /// Time given to an end-to-end delivery receipt to arrive before a
+  /// link-acked packet is retried.
+  static const Duration receiptGrace = Duration(seconds: 30);
 
   OutboxDaemon({
     required this.db,
@@ -36,25 +43,26 @@ class OutboxDaemon {
     start();
   }
 
-  /// Starts listening for peer connection events and sets up periodic maintenance.
+  /// Starts periodic maintenance. Peer connect/disconnect orchestration is
+  /// owned by RouterEngine so each link is flushed exactly once per event.
   void start() {
-    _peerSub?.cancel();
-    _peerSub = transport.peerEvents.listen((event) {
-      if (event.eventType == PeerConnectionEventType.onConnected) {
-        onPeerConnected(event.peerId);
-      }
-    });
-
     _maintenanceTimer?.cancel();
-    _maintenanceTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+    _maintenanceTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       maintenance();
     });
 
-    debugPrint('OMNILINK_OUTBOX: OutboxDaemon started and listening for peer connections.');
+    AppLogger.info('OutboxDaemon started; peer lifecycle is owned by RouterEngine.', domain: LogDomain.routing);
   }
 
-  /// Enqueues an encrypted packet envelope into the persistent SQLite Outbox queue.
+  /// Persists an encrypted packet envelope, then attempts an immediate flush.
   Future<void> enqueue(PacketEnvelope envelope) async {
+    await persist(envelope);
+    unawaited(flushAll());
+  }
+
+  /// Durably writes the envelope without attempting transmission.
+  /// Used by the outbox-first send path so the row exists before radio I/O.
+  Future<void> persist(PacketEnvelope envelope) async {
     try {
       final queued = QueuedPacket(
         packetId: envelope.packetId,
@@ -71,72 +79,201 @@ class OutboxDaemon {
       );
 
       await db.insertOrUpdateQueuedPacket(queued);
-      debugPrint('OMNILINK_OUTBOX: queued packet ${envelope.packetId} for recipient ${envelope.recipientId}');
-    } catch (e) {
-      debugPrint('OMNILINK_OUTBOX: Error enqueueing packet ${envelope.packetId}: $e');
+      AppLogger.info('Persisted packet ${envelope.packetId} for recipient ${envelope.recipientId}', domain: LogDomain.routing);
+    } catch (e, s) {
+      AppLogger.error('Error persisting packet ${envelope.packetId}', domain: LogDomain.routing, error: e, stackTrace: s);
     }
   }
 
-  /// TASK 3: Force immediate outbox flush when learning or confirming a peer's cryptographic nodeId.
+  /// Removes the durable copy after a verified end-to-end delivery receipt.
+  Future<void> acknowledgeDelivery(String packetId) async {
+    try {
+      await db.deleteQueuedPacket(packetId);
+      AppLogger.info('End-to-end receipt confirmed for $packetId; outbox copy removed.', domain: LogDomain.routing);
+    } catch (e, s) {
+      AppLogger.error('Error acknowledging delivered packet $packetId', domain: LogDomain.routing, error: e, stackTrace: s);
+    }
+  }
+
+  /// Keeps a link-acked packet in the outbox but delays its next attempt to
+  /// give the receiver's delivery receipt time to arrive.
+  Future<void> markAwaitingReceipt(String packetId) async {
+    try {
+      await db.markOutboxPacketAwaitingReceipt(
+        packetId,
+        DateTime.now().add(receiptGrace),
+      );
+    } catch (e, s) {
+      AppLogger.error('Error marking packet $packetId awaiting receipt', domain: LogDomain.routing, error: e, stackTrace: s);
+    }
+  }
+
+  void onPeerDisconnected(String peerId) {
+    _flushingPeerIds.remove(peerId);
+  }
+
+  /// Triggers immediate flush scan for all currently connected peer links.
+  Future<void> flushAll() async {
+    final connectedPeers = getConnectedPeers()
+        .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
+        .toList();
+
+    for (final peer in connectedPeers) {
+      await _flushPeerOutbox(peer.peerId, peer.nodeId);
+    }
+  }
+
+  /// Force immediate outbox flush when learning or confirming a peer's cryptographic nodeId & static X25519 key.
   Future<void> onIdentityLearned(String nodeId, String peerId) async {
     try {
-      final pendingPackets = await db.getPendingOutboxPackets();
-      final matchingPackets = pendingPackets.where((packet) {
-        return packet.recipientNodeId == nodeId || packet.recipientNodeId == peerId;
-      }).toList();
+      _flushingPeerIds.remove(peerId); // Release any stale connection lock
+      AppLogger.info('Identity learned for $nodeId (peerId=$peerId). Flushing outbox immediately.', domain: LogDomain.routing);
+      await messageRepo.migrateConversationId(peerId, nodeId);
+      await _processQueuedPlaintextMessages(peerId, nodeId);
+      await _flushPeerOutbox(peerId, nodeId);
+    } catch (e, s) {
+      AppLogger.error('Error in onIdentityLearned for peer $peerId', domain: LogDomain.routing, error: e, stackTrace: s);
+    }
+  }
 
-      debugPrint('OMNILINK_OUTBOX: Identity learned for $nodeId (peerId=$peerId). Flushing ${matchingPackets.length} pending packets immediately.');
+  /// Encrypts and transmits any queued plaintext messages once remote X25519 static key is available.
+  Future<void> _processQueuedPlaintextMessages(String peerId, String? peerNodeId) async {
+    try {
+      final connectedPeers = getConnectedPeers();
+      final peer = connectedPeers.firstWhereOrNull(
+        (p) => p.peerId == peerId || (peerNodeId != null && p.nodeId == peerNodeId),
+      );
 
-      if (matchingPackets.isNotEmpty) {
-        await onPeerConnected(peerId);
+      String? staticX25519 = peer?.staticX25519PublicKeyHex;
+      final targetNodeId = peer?.nodeId ?? peerNodeId;
+
+      if ((staticX25519 == null || staticX25519.isEmpty) && targetNodeId != null && targetNodeId.isNotEmpty) {
+        final dbPeer = await PeerRepository(dbService: DatabaseService.instance).getPeerByNodeId(targetNodeId);
+        staticX25519 = dbPeer?.staticX25519PublicKeyHex;
       }
-    } catch (e) {
-      debugPrint('OMNILINK_OUTBOX: Error in onIdentityLearned: $e');
+
+      if (staticX25519 == null || staticX25519.isEmpty || targetNodeId == null || targetNodeId.isEmpty) {
+        return;
+      }
+
+      final queuedMessages = await messageRepo.getMessagesForConversation(targetNodeId);
+      final pendingPlaintext = queuedMessages.where((m) => m.state == MessageState.queued).toList();
+
+      if (pendingPlaintext.isEmpty) return;
+
+      final myNodeId = router.getMyNodeId();
+      final masterKeyPair = router.getMasterKeyPair?.call();
+
+      if (myNodeId.isEmpty || masterKeyPair == null) return;
+
+      // Access static X25519 key directly from in-memory identity state (zero disk Keystore reads)
+      final staticKeyPair = router.getStaticX25519KeyPair?.call();
+      if (staticKeyPair == null) {
+        AppLogger.warn(
+          'Deferred processing queued plaintext messages for $targetNodeId: staticX25519KeyPair not yet initialized in memory.',
+          domain: LogDomain.routing,
+        );
+        return;
+      }
+
+      for (final msg in pendingPlaintext) {
+        if (msg.plaintextBody == null || msg.plaintextBody!.isEmpty) continue;
+
+        // Atomic reservation: prevent concurrent flushes or send taps from double-encrypting
+        await messageRepo.updateMessageState(msg.messageId, MessageState.sending);
+
+        try {
+          final envelope = await router.packetService.createEncryptedMessageEnvelope(
+            senderNodeId: myNodeId,
+            senderKeyPair: masterKeyPair,
+            senderStaticX25519KeyPair: staticKeyPair,
+            recipientNodeId: targetNodeId,
+            recipientStaticX25519PublicKeyHex: staticX25519,
+            plaintextBody: msg.plaintextBody!,
+            packetId: msg.messageId,
+          );
+
+          await router.sendMessage(envelope);
+          AppLogger.info('Encrypted and transmitted queued plaintext message ${msg.messageId} to $targetNodeId', domain: LogDomain.routing);
+        } catch (err, st) {
+          // Revert to queued on transmission failure so it can be retried on next connect
+          await messageRepo.updateMessageState(msg.messageId, MessageState.queued);
+          AppLogger.error('Failed to encrypt/send queued message ${msg.messageId}', domain: LogDomain.routing, error: err, stackTrace: st);
+        }
+      }
+    } catch (e, s) {
+      AppLogger.error('Error processing queued plaintext messages for peer $peerId', domain: LogDomain.routing, error: e, stackTrace: s);
     }
   }
 
   /// Flushes matching outbox packets when a new peer connects.
   Future<void> onPeerConnected(String peerId) async {
-    if (_flushingPeerIds.contains(peerId)) return;
+    final connectedPeers = getConnectedPeers()
+        .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
+        .toList();
+
+    final peerDevice = connectedPeers.firstWhereOrNull((p) => p.peerId == peerId);
+    final peerNodeId = peerDevice?.nodeId;
+
+    if (peerNodeId != null && peerNodeId.isNotEmpty) {
+      await messageRepo.migrateConversationId(peerId, peerNodeId);
+    }
+    await _processQueuedPlaintextMessages(peerId, peerNodeId);
+    await _flushPeerOutbox(peerId, peerNodeId);
+  }
+
+  /// Receipt-driven outbox flush for one peer link.
+  ///
+  /// A successful radio send only moves the row to "awaiting receipt"; the row
+  /// is removed exclusively by [acknowledgeDelivery]. This is what makes a
+  /// receiver crash or a lost receipt safe: the sender still has the packet.
+  Future<void> _flushPeerOutbox(String peerId, String? peerNodeId) async {
+    if (_flushingPeerIds.contains(peerId)) {
+      AppLogger.info('Bypassing duplicate concurrent flush for peer $peerId', domain: LogDomain.routing);
+      return;
+    }
+
     _flushingPeerIds.add(peerId);
-    debugPrint('OMNILINK_FIX: Locked outbox flush for peer $peerId');
+
+    final metrics = MetricsService.instance;
+    metrics.startTimer('outbox_flush_duration');
 
     try {
-      debugPrint('OMNILINK_OUTBOX: Peer connected ($peerId). Processing pending outbox items...');
-      final connectedPeers = getConnectedPeers()
-          .where((p) => p.connectionStatus == PeerConnectionStatus.connected)
-          .toList();
+      // Anti-entropy handshake: exchange summary vectors for missed packets.
+      unawaited(router.routeProtocol.sendSyncHandshake(peerId));
 
-      final peerDevice = connectedPeers.firstWhere(
-        (p) => p.peerId == peerId,
-        orElse: () => PeerDevice(
-          peerId: peerId,
-          friendlyName: '',
-          lastSeenAt: DateTime.now(),
-          transportType: 'ANDROID_NEARBY',
-          connectionStatus: PeerConnectionStatus.connected,
-        ),
-      );
+      final pendingPackets = await db.getDueOutboxPackets(DateTime.now());
+      metrics.setGauge('outbox_pending_count', pendingPackets.length.toDouble());
 
-      final peerNodeId = peerDevice.nodeId ?? peerId;
-      final pendingPackets = await db.getPendingOutboxPackets();
+      if (pendingPackets.isEmpty) return;
 
-      // Filter packets for this peer (direct recipient or relay path)
+      // Filter packets for this peer (direct recipient, peerId/nodeId match, or valid mesh relay TTL)
       final relevantPackets = pendingPackets.where((packet) {
-        return packet.recipientNodeId == peerNodeId ||
+        final isDirect = packet.recipientNodeId == peerNodeId ||
             packet.recipientNodeId == peerId ||
-            packet.status == 'pending';
+            (peerNodeId != null && packet.recipientNodeId.contains(peerNodeId)) ||
+            (peerNodeId != null && peerNodeId.contains(packet.recipientNodeId));
+        return isDirect || packet.ttl > 0;
       }).toList();
 
-      // Sort by dynamic urgencyScore (priority weight + age + TTL - retry penalty)
+      if (relevantPackets.isEmpty) return;
+
       relevantPackets.sort((a, b) => b.urgencyScore.compareTo(a.urgencyScore));
 
-      debugPrint('OMNILINK_OUTBOX: Found ${relevantPackets.length} candidate packet(s) to transmit to $peerId');
+      AppLogger.info('Found ${relevantPackets.length} due packet(s) for $peerId ($peerNodeId)', domain: LogDomain.routing);
+
+      // Claim with a lease. If this process dies mid-flush, the rows become
+      // eligible again after the lease instead of staying 'sending' forever.
+      final candidateIds = relevantPackets.map((p) => p.packetId).toList();
+      final leaseUntil = DateTime.now().add(const Duration(minutes: 2));
+      await db.claimOutboxPackets(candidateIds, leaseUntil);
+
+      final awaitingReceiptIds = <String>[];
+      final failedPacketsToUpdate = <QueuedPacket>[];
 
       for (final packet in relevantPackets) {
         final payloadBytes = utf8.encode(packet.payload);
 
-        debugPrint('OMNILINK_FIX: Flushing outbox packet ${packet.packetId} through SendQueueManager for peer $peerId');
         final success = await router.sendQueueManager.enqueueAndSend(
           packetId: packet.packetId,
           peerId: peerId,
@@ -144,67 +281,73 @@ class OutboxDaemon {
         );
 
         if (success) {
-          await db.deleteQueuedPacket(packet.packetId);
-          await messageRepo.updateMessageState(packet.packetId, MessageState.sending);
-          debugPrint('OMNILINK_OUTBOX: Transmitted packet ${packet.packetId} to $peerId. Removed from outbox.');
+          awaitingReceiptIds.add(packet.packetId);
+          await messageRepo.updateMessageStateUnlessReceiptReceived(
+            packet.packetId,
+            MessageState.delivered,
+          );
         } else {
-          await _retryWithBackoff(packet);
+          final newAttempts = packet.retryCount + 1;
+          final delayMs = min(pow(2, newAttempts).toInt() * 1000, 60000);
+          failedPacketsToUpdate.add(
+            packet.copyWith(
+              retryCount: newAttempts,
+              nextRetryAt: DateTime.now().add(Duration(milliseconds: delayMs)),
+              status: 'pending',
+            ),
+          );
+          await messageRepo.updateMessageStateUnlessReceiptReceived(
+            packet.packetId,
+            MessageState.queued,
+          );
         }
       }
-    } catch (e) {
-      debugPrint('OMNILINK_OUTBOX: Exception during outbox flush: $e');
+
+      if (awaitingReceiptIds.isNotEmpty) {
+        final count = await db.markOutboxPacketsAwaitingReceipt(
+          awaitingReceiptIds,
+          DateTime.now().add(receiptGrace),
+        );
+        metrics.increment('outbox_packets_awaiting_receipt', count);
+        AppLogger.info('$count packet(s) link-acked for $peerId; awaiting end-to-end receipts.', domain: LogDomain.routing);
+      }
+
+      if (failedPacketsToUpdate.isNotEmpty) {
+        await db.batchUpdateQueuedPackets(failedPacketsToUpdate);
+        metrics.increment('outbox_packets_failed', failedPacketsToUpdate.length);
+        AppLogger.warn('Batch updated ${failedPacketsToUpdate.length} failed packets with exponential backoff', domain: LogDomain.routing);
+      }
+    } catch (e, s) {
+      AppLogger.error('Exception during outbox flush for peer $peerId', domain: LogDomain.routing, error: e, stackTrace: s);
     } finally {
+      metrics.stopTimer('outbox_flush_duration');
       _flushingPeerIds.remove(peerId);
-      debugPrint('OMNILINK_FIX: Unlocked outbox flush for peer $peerId');
     }
   }
 
-  /// Schedules a packet retry with exponential backoff: min(2^attempts * 1000, 60000) ms.
-  Future<void> _retryWithBackoff(QueuedPacket packet) async {
-    final newAttempts = packet.retryCount + 1;
-    final delayMs = min(pow(2, newAttempts).toInt() * 1000, 60000);
-    final nextRetry = DateTime.now().add(Duration(milliseconds: delayMs));
-
-    final updatedPacket = packet.copyWith(
-      retryCount: newAttempts,
-      nextRetryAt: nextRetry,
-      status: 'pending',
-    );
-
-    await db.insertOrUpdateQueuedPacket(updatedPacket);
-    debugPrint('OMNILINK_OUTBOX: Scheduled retry #$newAttempts for packet ${packet.packetId} in ${delayMs}ms');
-
-    Timer(Duration(milliseconds: delayMs), () async {
-      final envelope = PacketEnvelope.fromJson(packet.payload);
-      await router.sendMessage(envelope);
-    });
-  }
-
-  /// Removes expired packets exceeding TTL time limit or 10 max retry attempts.
+  /// Removes expired packets exceeding TTL time limit or 10 max retry attempts in a single batch transaction.
   Future<void> _expireOldMessages() async {
     try {
       final now = DateTime.now();
       final allPackets = await db.getAllQueuedPackets();
-      int expiredCount = 0;
+      final expiredIds = <String>[];
 
       for (final packet in allPackets) {
         final envelope = PacketEnvelope.fromJson(packet.payload);
-        final isExpiredByTime = envelope.expiresAt < now.millisecondsSinceEpoch;
-        final isExceededRetries = packet.retryCount > 10;
-
-        if (isExpiredByTime || isExceededRetries) {
-          await db.deleteQueuedPacket(packet.packetId);
-          await messageRepo.updateMessageState(packet.packetId, MessageState.failed);
-          expiredCount++;
-          debugPrint('OMNILINK_OUTBOX: Expired packet ${packet.packetId} (timeExpired=$isExpiredByTime, retries=${packet.retryCount})');
+        // Store-and-forward messages may legitimately retry many times while
+        // the recipient is offline. Only the envelope expiry ends their life.
+        if (envelope.expiresAt < now.millisecondsSinceEpoch) {
+          expiredIds.add(packet.packetId);
+          await messageRepo.updateMessageState(packet.packetId, MessageState.expired);
         }
       }
 
-      if (expiredCount > 0) {
-        debugPrint('OMNILINK_OUTBOX: Expired $expiredCount old/failed messages from outbox_queue.');
+      if (expiredIds.isNotEmpty) {
+        final count = await db.deleteQueuedPacketsByIds(expiredIds);
+        AppLogger.info('Batch expired $count old/failed packets from outbox queue', domain: LogDomain.routing);
       }
-    } catch (e) {
-      debugPrint('OMNILINK_OUTBOX: Error expiring old messages: $e');
+    } catch (e, s) {
+      AppLogger.error('Error expiring old messages', domain: LogDomain.routing, error: e, stackTrace: s);
     }
   }
 
@@ -248,7 +391,6 @@ class OutboxDaemon {
   }
 
   void dispose() {
-    _peerSub?.cancel();
     _maintenanceTimer?.cancel();
   }
 }

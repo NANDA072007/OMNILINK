@@ -8,6 +8,7 @@ class PacketEnvelope {
   final String packetId;
   final String senderId;
   final String recipientId;
+  final String? ephemeralPublicKey;
   final int createdAt;
   final int expiresAt;
   final int ttl;
@@ -24,6 +25,7 @@ class PacketEnvelope {
     required this.packetId,
     required this.senderId,
     required this.recipientId,
+    this.ephemeralPublicKey,
     required this.createdAt,
     required this.expiresAt,
     this.ttl = 7,
@@ -37,9 +39,11 @@ class PacketEnvelope {
   });
 
   /// Constructs the canonical string representation used to compute the Ed25519 signature digest.
-  /// Canonical Format: packet_id + sender_id + recipient_id + created_at + payload_hash
+  /// Binds ALL end-to-end immutable fields and EXCLUDES relay-mutable fields (ttl, hopCount, maxHops, priority).
+  /// Format: v=0.1|id=$packetId|sender=$senderId|recipient=$recipientId|eph=${ephemeralPublicKey ?? ''}|created=$createdAt|expires=$expiresAt|type=$messageType|payload_hash=$payloadHash
   String toCanonicalString() {
-    return '$packetId$senderId$recipientId$createdAt$payloadHash';
+    final eph = ephemeralPublicKey ?? '';
+    return 'v=$protocolVersion|id=$packetId|sender=$senderId|recipient=$recipientId|eph=$eph|created=$createdAt|expires=$expiresAt|type=$messageType|payload_hash=$payloadHash';
   }
 
   /// Converts the canonical string to UTF-8 bytes for cryptographic signing/verification.
@@ -53,6 +57,7 @@ class PacketEnvelope {
       'packet_id': packetId,
       'sender_id': senderId,
       'recipient_id': recipientId,
+      if (ephemeralPublicKey != null) 'ephemeral_public_key': ephemeralPublicKey,
       'created_at': createdAt,
       'expires_at': expiresAt,
       'ttl': ttl,
@@ -72,6 +77,7 @@ class PacketEnvelope {
       packetId: map['packet_id'] as String,
       senderId: map['sender_id'] as String,
       recipientId: map['recipient_id'] as String,
+      ephemeralPublicKey: map['ephemeral_public_key'] as String?,
       createdAt: map['created_at'] as int,
       expiresAt: map['expires_at'] as int,
       ttl: (map['ttl'] ?? 7) as int,
@@ -95,6 +101,7 @@ class PacketEnvelope {
     String? packetId,
     String? senderId,
     String? recipientId,
+    String? ephemeralPublicKey,
     int? createdAt,
     int? expiresAt,
     int? ttl,
@@ -111,6 +118,7 @@ class PacketEnvelope {
       packetId: packetId ?? this.packetId,
       senderId: senderId ?? this.senderId,
       recipientId: recipientId ?? this.recipientId,
+      ephemeralPublicKey: ephemeralPublicKey ?? this.ephemeralPublicKey,
       createdAt: createdAt ?? this.createdAt,
       expiresAt: expiresAt ?? this.expiresAt,
       ttl: ttl ?? this.ttl,
@@ -132,6 +140,6 @@ class PacketEnvelope {
 
   @override
   String toString() {
-    return 'PacketEnvelope(id: $packetId, type: $messageType, sender: ${senderId.substring(0, 8)}..., size: ${sizeInBytes}B)';
+    return 'PacketEnvelope(id: $packetId, type: $messageType, sender: ${senderId.length >= 8 ? senderId.substring(0, 8) : senderId}..., size: ${sizeInBytes}B)';
   }
 }

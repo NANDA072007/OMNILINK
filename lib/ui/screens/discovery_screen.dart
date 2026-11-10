@@ -1,42 +1,20 @@
-import 'dart:io' show Platform;
-
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+
 import 'package:permission_handler/permission_handler.dart';
 
-import '../../core/models/peer_device.dart';
-import '../../core/models/transport_health.dart';
 import '../../core/providers.dart';
-import '../../transport_bridge/android_transport_adapter.dart';
+import '../../state/models/discovery_state.dart';
+import '../../state/models/radio_status_state.dart';
+import '../../state/providers/discovery_state_provider.dart';
+import '../../state/providers/radio_status_provider.dart';
 import 'chat_screen.dart';
-
-/// Temporary diagnostic data from the native [AndroidTransportAdapter] probe.
-class PermDiagnostics {
-  final int sdkInt;
-  final String versionName;
-  final int? versionCode;
-  final Map<String, bool> permissionGranted;
-  final bool playServicesAvailable;
-  final int playServicesStatusCode;
-  final bool playServicesUserResolvable;
-  final bool? bluetoothEnabled;
-  final bool? wifiEnabled;
-  final bool? locationEnabled;
-
-  const PermDiagnostics({
-    required this.sdkInt,
-    required this.versionName,
-    this.versionCode,
-    required this.permissionGranted,
-    required this.playServicesAvailable,
-    required this.playServicesStatusCode,
-    required this.playServicesUserResolvable,
-    this.bluetoothEnabled,
-    this.wifiEnabled,
-    this.locationEnabled,
-  });
-}
+import '../../core/models/peer_device.dart';
+import '../widgets/discovered_device_card.dart';
+import '../widgets/radar_widget.dart';
+import '../widgets/readiness_accordion.dart';
 
 class DiscoveryScreen extends ConsumerStatefulWidget {
   const DiscoveryScreen({super.key});
@@ -45,624 +23,503 @@ class DiscoveryScreen extends ConsumerStatefulWidget {
   ConsumerState<DiscoveryScreen> createState() => _DiscoveryScreenState();
 }
 
-class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen> {
-  bool _isDiscovering = false;
-  bool _keepScreenAwake = true;
-  PermDiagnostics? _diag;
-  String _lastRequestSummary = 'not requested yet';
-
+class _DiscoveryScreenState extends ConsumerState<DiscoveryScreen>
+    with WidgetsBindingObserver {
   static const MethodChannel _controlChannel =
       MethodChannel('omnilink/transport/control');
+
+  bool? _batteryOptimizationExempt;
+  bool? _notificationPermissionGranted;
 
   @override
   void initState() {
     super.initState();
-    _refreshNativeDiagnostics();
+    WidgetsBinding.instance.addObserver(this);
+    Future.microtask(() async {
+      await ref.read(radioStatusProvider.notifier).refreshStatus();
+      await _refreshBackgroundReadiness();
+    });
   }
 
-  Future<void> _toggleDiscovery() async {
-    final adapter = ref.read(transportAdapterProvider);
-    final t0 = DateTime.now().millisecondsSinceEpoch;
-
-    if (_isDiscovering) {
-      debugPrint('OMNILINK_DART: [t=$t0] stopDiscovery requested');
-      final ok = await adapter.stopDiscovery();
-      debugPrint('OMNILINK_DART: [t=${DateTime.now().millisecondsSinceEpoch}] stopDiscovery result=$ok');
-      setState(() {
-        _isDiscovering = false;
-      });
-    } else {
-      debugPrint('OMNILINK_DART: [t=$t0] startDiscovery requested');
-      final granted = await _requestPermissionsWithLogs();
-      await _refreshNativeDiagnostics();
-
-      if (!granted) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(_lastRequestSummary),
-            action: SnackBarAction(
-              label: 'Open Settings',
-              onPressed: openAppSettings,
-            ),
-          ),
-        );
-        return;
-      }
-      final ok = await adapter.startDiscovery();
-      debugPrint('OMNILINK_DART: [t=${DateTime.now().millisecondsSinceEpoch}] startDiscovery result=$ok');
-      if (!ok) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Discovery failed to start. Ensure Bluetooth, Wi-Fi, and Location are ON.',
-              ),
-            ),
-          );
-        }
-        return;
-      }
-      setState(() {
-        _isDiscovering = true;
-      });
-    }
-  }
-
-  Future<bool> _requestPermissionsWithLogs() async {
-    try {
-      final t0 = DateTime.now().millisecondsSinceEpoch;
-      debugPrint('OMNILINK_DART: [t=$t0] Requesting permissions flow...');
-      final sdkInt = _diag?.sdkInt ?? _readSdkFromPlatformVersion();
-      debugPrint('OMNILINK_DART: detected Android SDK = $sdkInt');
-
-      final permissions = <Permission>[
-        if (sdkInt >= 31) ...[
-          Permission.bluetoothScan,
-          Permission.bluetoothConnect,
-          Permission.bluetoothAdvertise,
-        ],
-        if (sdkInt >= 33) Permission.nearbyWifiDevices,
-        Permission.locationWhenInUse,
-      ];
-
-      var allGranted = true;
-
-      for (final permission in permissions) {
-        final status = await permission.request();
-        debugPrint('OMNILINK_DART: ${permission.toString()} -> $status');
-        if (!status.isGranted && !status.isRestricted) {
-          allGranted = false;
-        }
-      }
-
-      _lastRequestSummary = allGranted
-          ? 'All required permissions granted.'
-          : 'Bluetooth, Wi-Fi, and Location permissions are required for peer discovery.';
-      debugPrint('OMNILINK_DART: allRequiredPermissionsGranted -> $allGranted');
-      return allGranted;
-    } catch (e, s) {
-      debugPrint('OMNILINK_DART: EXCEPTION in request flow: $e\n$s');
-      _lastRequestSummary = 'Permission request failed: $e';
-      return false;
-    }
-  }
-
-  int _readSdkFromPlatformVersion() {
-    try {
-      final version = Platform.version;
-      final apiMatch = RegExp(r'\(API (\d+)\)').firstMatch(version);
-      if (apiMatch != null) return int.parse(apiMatch.group(1)!);
-      final parts = version.split('.');
-      if (parts.isNotEmpty) return int.tryParse(parts.first) ?? 0;
-    } catch (_) {}
-    return 0;
-  }
-
-  Future<void> _requestPermissionsStandalone() async {
-    final granted = await _requestPermissionsWithLogs();
-    await _refreshNativeDiagnostics();
+  Future<void> _refreshBackgroundReadiness() async {
+    final adapter = ref.read(androidTransportAdapterProvider);
+    final exempt = await adapter.isIgnoringBatteryOptimizations();
+    final notificationsGranted = await Permission.notification.isGranted;
     if (!mounted) return;
-    if (!granted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(_lastRequestSummary),
-          action: SnackBarAction(label: 'Open Settings', onPressed: openAppSettings),
-        ),
-      );
+    setState(() {
+      _batteryOptimizationExempt = exempt;
+      _notificationPermissionGranted = notificationsGranted;
+    });
+  }
+
+  Future<void> _requestBatteryExemption() async {
+    final adapter = ref.read(androidTransportAdapterProvider);
+    await adapter.requestIgnoreBatteryOptimizations();
+    await Future.delayed(const Duration(milliseconds: 600));
+    await _refreshBackgroundReadiness();
+  }
+
+  Future<void> _requestNotificationPermission() async {
+    await Permission.notification.request();
+    await _refreshBackgroundReadiness();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      ref.read(radioStatusProvider.notifier).refreshStatus();
+      _refreshBackgroundReadiness();
     }
-    setState(() {});
   }
 
-  Future<void> _openAppSettings() async {
-    await openAppSettings();
-    await _refreshNativeDiagnostics();
-    if (mounted) setState(() {});
-  }
+  Future<void> _toggleBluetooth() async {
+    final radioState = ref.read(radioStatusProvider);
 
-  Future<void> _refreshNativeDiagnostics() async {
+    if (!radioState.bluetoothPermissionGranted) {
+      debugPrint('OMNILINK_UI: Requesting Bluetooth permissions...');
+      await [
+        Permission.bluetoothConnect,
+        Permission.bluetoothScan,
+        Permission.bluetoothAdvertise,
+      ].request();
+      await ref.read(radioStatusProvider.notifier).refreshStatus();
+      return;
+    }
+
     try {
-      final details =
-          await _controlChannel.invokeMapMethod<Object?, Object?>(
-        'getAndroidPermissionDetails',
-      );
-      if (details == null) return;
-      final granted = <String, bool>{};
-      for (final key in details.keys) {
-        if (key.toString().endsWith('Granted') && details[key] is bool) {
-          granted[key.toString()] = details[key] as bool;
-        }
-      }
-      if (mounted) {
-        setState(() {
-          _diag = PermDiagnostics(
-            sdkInt: (details['sdkInt'] as num?)?.toInt() ?? 0,
-            versionName: details['versionName']?.toString() ?? '?',
-            versionCode: (details['versionCode'] as num?)?.toInt(),
-            permissionGranted: granted,
-            playServicesAvailable: details['playServicesAvailable'] as bool? ?? false,
-            playServicesStatusCode:
-                (details['playServicesStatusCode'] as num?)?.toInt() ?? -1,
-            playServicesUserResolvable:
-                details['playServicesUserResolvable'] as bool? ?? false,
-            bluetoothEnabled: details['bluetoothEnabled'] as bool?,
-            wifiEnabled: details['wifiEnabled'] as bool?,
-            locationEnabled: details['locationEnabled'] as bool?,
-          );
-        });
-      }
-    } on MissingPluginException catch (e) {
-      debugPrint('OMNILINK_DART: native diagnostics probe missing: $e');
+      await _controlChannel.invokeMethod('requestEnableBluetooth');
+      await Future.delayed(const Duration(milliseconds: 500));
+      await ref.read(radioStatusProvider.notifier).refreshStatus();
     } catch (e) {
-      debugPrint('OMNILINK_DART: native diagnostics probe failed: $e');
+      debugPrint('OMNILINK_UI: Error toggling Bluetooth: $e');
     }
   }
 
-  /// Task 4: User-Visible Transport Status Card displaying Bluetooth Audio & Mode Health
-  Widget _buildRadioWarningBanner() {
-    final diag = _diag;
-    if (diag == null) return const SizedBox.shrink();
+  Future<void> _toggleWifi() async {
+    final radioState = ref.read(radioStatusProvider);
 
-    final btOff = diag.bluetoothEnabled == false;
-    final wifiOff = diag.wifiEnabled == false;
-    final locOff = diag.locationEnabled == false;
-    final isAndroid11OrBelow = diag.sdkInt <= 31;
+    if (!radioState.wifiPermissionGranted) {
+      debugPrint('OMNILINK_UI: Requesting Nearby Wi-Fi Devices permission...');
+      await Permission.nearbyWifiDevices.request();
+      await ref.read(radioStatusProvider.notifier).refreshStatus();
+      return;
+    }
 
-    final health = TransportHealth.evaluate(
-      bluetoothEnabled: !btOff,
-      wifiEnabled: !wifiOff,
-      locationEnabled: !locOff,
-      audioDeviceConnected: false,
-      headsetConnected: false,
-      canDiscover: !isAndroid11OrBelow || !locOff,
-    );
-
-    final cardColor = btOff
-        ? const Color(0xFFD32F2F)
-        : (wifiOff ? Colors.amber.shade900 : const Color(0xFF1E88E5));
-
-    return Container(
-      color: cardColor,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                btOff ? Icons.bluetooth_disabled_rounded : Icons.info_outline_rounded,
-                color: Colors.white,
-                size: 22,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  btOff
-                      ? 'BLUETOOTH REQUIRED'
-                      : 'MODE: ${health.recommendedMode.name.toUpperCase()}',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                    fontSize: 12,
-                    letterSpacing: 0.5,
-                  ),
-                ),
-              ),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.white,
-                  foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                ),
-                onPressed: _openAppSettings,
-                child: const Text('Radios', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          Text(
-            health.userMessage,
-            style: const TextStyle(color: Colors.white, fontSize: 11),
-          ),
-        ],
-      ),
-    );
+    try {
+      await _controlChannel.invokeMethod('requestToggleWifi');
+      await Future.delayed(const Duration(milliseconds: 500));
+      await ref.read(radioStatusProvider.notifier).refreshStatus();
+    } catch (e) {
+      debugPrint('OMNILINK_UI: Error toggling Wi-Fi: $e');
+    }
   }
 
-  Widget _buildDebugCard(dynamic adapter) {
-    final diag = _diag;
+  Future<void> _toggleLocation() async {
+    final radioState = ref.read(radioStatusProvider);
 
-    String boolLabel(bool? b) => b == null ? '? (no data)' : (b ? 'ON' : 'OFF');
+    if (!radioState.locationPermissionGranted) {
+      debugPrint('OMNILINK_UI: Requesting Fine Location permission...');
+      await Permission.location.request();
+      await ref.read(radioStatusProvider.notifier).refreshStatus();
+      return;
+    }
 
-    return Container(
-      color: const Color(0xFF202020),
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
-            children: [
-              Icon(Icons.bug_report_rounded, size: 16, color: Colors.orangeAccent),
-              SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  'DIAGNOSTICS & HARDWARE CONTROL',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.orangeAccent,
-                    letterSpacing: 0.5,
-                  ),
-                ),
-              ),
-              Text(
-                'Strategy: P2P_STAR',
-                style: TextStyle(fontSize: 10, color: Color(0xFF00E676), fontWeight: FontWeight.bold),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          Wrap(
-            spacing: 12,
-            runSpacing: 2,
-            children: [
-              _diagLine('SDK', diag?.sdkInt.toString() ?? '?'),
-              _diagLine('App', diag?.versionName ?? '?'),
-              _diagLine('GMS', diag == null ? '?' : (diag.playServicesAvailable ? 'OK' : 'MISSING')),
-              _diagLine('BT', boolLabel(diag?.bluetoothEnabled)),
-              _diagLine('Wi-Fi', boolLabel(diag?.wifiEnabled)),
-              _diagLine('Location', boolLabel(diag?.locationEnabled)),
-            ],
-          ),
-          const SizedBox(height: 4),
-          Wrap(
-            spacing: 4,
-            runSpacing: 2,
-            children: [
-              _permChip('BT_SCAN', diag?.permissionGranted['bluetoothScanGranted']),
-              _permChip('BT_CONNECT', diag?.permissionGranted['bluetoothConnectGranted']),
-              _permChip('BT_ADVERTISE', diag?.permissionGranted['bluetoothAdvertiseGranted']),
-              _permChip('FINE_LOC', diag?.permissionGranted['fineLocationGranted']),
-              _permChip('NEARBY_WIFI', diag?.permissionGranted['nearbyWifiDevicesGranted']),
-            ],
-          ),
-          const SizedBox(height: 6),
-          Row(
-            children: [
-              const Icon(Icons.screen_lock_portrait_rounded, size: 14, color: Colors.white70),
-              const SizedBox(width: 6),
-              const Text('Keep Screen Awake during tests', style: TextStyle(fontSize: 11, color: Colors.white70)),
-              const Spacer(),
-              Switch(
-                value: _keepScreenAwake,
-                activeTrackColor: const Color(0xFF00E676),
-                onChanged: (val) {
-                  setState(() {
-                    _keepScreenAwake = val;
-                  });
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 4),
-          Wrap(
-            spacing: 8,
-            runSpacing: 6,
-            children: [
-              OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.orangeAccent,
-                  side: const BorderSide(color: Colors.orangeAccent, width: 1),
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                ),
-                onPressed: _requestPermissionsStandalone,
-                icon: const Icon(Icons.touch_app_rounded, size: 14),
-                label: const Text('Request Permissions', style: TextStyle(fontSize: 11)),
-              ),
-              OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.lightBlueAccent,
-                  side: const BorderSide(color: Colors.lightBlueAccent, width: 1),
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                ),
-                onPressed: _openAppSettings,
-                icon: const Icon(Icons.settings_rounded, size: 14),
-                label: const Text('Open App Settings', style: TextStyle(fontSize: 11)),
-              ),
-              OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.white70,
-                  side: const BorderSide(color: Colors.white70, width: 1),
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                ),
-                onPressed: () {
-                  _refreshNativeDiagnostics();
-                  setState(() {});
-                },
-                icon: const Icon(Icons.refresh_rounded, size: 14),
-                label: const Text('Refresh', style: TextStyle(fontSize: 11)),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _diagLine(String label, String value) {
-    return Text(
-      '$label: $value',
-      style: const TextStyle(fontSize: 11, color: Colors.white70),
-    );
-  }
-
-  Widget _permChip(String label, bool? granted) {
-    final color = granted == null
-        ? Colors.grey
-        : (granted ? const Color(0xFF00E676) : Colors.redAccent);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: color.withAlpha(40),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        '$label: ${granted == null ? '?' : (granted ? 'granted' : 'denied')}',
-        style: TextStyle(fontSize: 9, color: color),
-      ),
-    );
+    try {
+      await _controlChannel.invokeMethod('requestToggleLocation');
+      await Future.delayed(const Duration(milliseconds: 500));
+      await ref.read(radioStatusProvider.notifier).refreshStatus();
+    } catch (e) {
+      debugPrint('OMNILINK_UI: Error toggling Location: $e');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final identityState = ref.watch(identityProvider);
-    final peerList = ref.watch(peerListProvider);
-    final adapter = ref.watch(transportAdapterProvider);
+    final radioState = ref.watch(radioStatusProvider);
+    final discoveryState = ref.watch(discoveryStateProvider);
 
     final nodeId = identityState.nodeId;
     final truncatedNodeId = (nodeId != null && nodeId.length >= 12)
         ? '${nodeId.substring(0, 6)}...${nodeId.substring(nodeId.length - 6)}'
-        : 'Generating Identity...';
+        : 'OMNI-LOCAL';
 
     return Scaffold(
-      appBar: AppBar(
-        title: Row(
+      backgroundColor: const Color(0xFF0D0E15),
+      body: SafeArea(
+        child: Column(
           children: [
-            const Icon(Icons.radar_rounded, color: Color(0xFF00E676)),
-            const SizedBox(width: 10),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('OMNILINK Direct'),
-                if (identityState.isLoading)
-                  const Text(
-                    'Generating Keypair...',
-                    style: TextStyle(fontSize: 11, color: Colors.grey),
-                  )
-                else
-                  Text(
-                    'ID: $truncatedNodeId',
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: Color(0xFF00E676),
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-              ],
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            icon: Icon(
-              _isDiscovering ? Icons.sensors_rounded : Icons.sensors_off_rounded,
-              color: _isDiscovering ? const Color(0xFF00E676) : Colors.grey,
-            ),
-            tooltip: _isDiscovering ? 'Discovery Active' : 'Discovery Stopped',
-            onPressed: _toggleDiscovery,
-          ),
-        ],
-      ),
-      body: identityState.isLoading
-          ? const Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
+            // =================================================================
+            // 1. HEADER
+            // =================================================================
+            Padding(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
+              child: Row(
                 children: [
-                  CircularProgressIndicator(color: Color(0xFF00E676)),
-                  SizedBox(height: 16),
-                  Text('Generating Master Ed25519 Identity...'),
-                ],
-              ),
-            )
-          : Column(
-              children: [
-                // User-Visible Transport Warning Banner (Fix #3)
-                _buildRadioWarningBanner(),
-                // Status Header Banner
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  color: const Color(0xFF161616),
-                  child: Row(
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(
-                        _isDiscovering
-                            ? Icons.wifi_tethering_rounded
-                            : Icons.wifi_tethering_off_rounded,
-                        size: 20,
-                        color: _isDiscovering ? const Color(0xFF00E676) : Colors.grey,
+                      const Text(
+                        'OMNILINK',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 2.0,
+                        ),
                       ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          _isDiscovering
-                              ? 'Scanning physical radios (Strategy.P2P_STAR)...'
-                              : 'Discovery stopped. Tap radar button to scan.',
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: _isDiscovering ? Colors.white : Colors.grey,
-                          ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Nearby connections · $truncatedNodeId',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.5),
+                          fontSize: 12,
+                          letterSpacing: 0.5,
                         ),
                       ),
                     ],
                   ),
-                ),
-                _buildDebugCard(adapter),
-                Expanded(
-                  child: peerList.isEmpty
-                      ? Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.devices_other_rounded,
-                                size: 64,
-                                color: Colors.grey.shade700,
-                              ),
-                              const SizedBox(height: 16),
-                              const Text(
-                                'No nearby devices found yet.',
-                                style: TextStyle(fontSize: 16, color: Colors.grey),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                'Tap the floating radar button below to start discovery.',
-                                style: TextStyle(fontSize: 12, color: Colors.grey),
-                              ),
-                            ],
-                          ),
-                        )
-                      : ListView.builder(
-                          padding: const EdgeInsets.all(12),
-                          itemCount: peerList.length,
-                          itemBuilder: (context, index) {
-                            final peer = peerList[index];
-                            final isConnected =
-                                peer.connectionStatus == PeerConnectionStatus.connected;
-
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 10),
-                              child: ListTile(
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 6,
-                                ),
-                                leading: CircleAvatar(
-                                  backgroundColor: isConnected
-                                      ? const Color(0xFF00E676).withAlpha(51)
-                                      : const Color(0xFF2C2C2C),
-                                  child: Icon(
-                                    Icons.phone_android_rounded,
-                                    color: isConnected
-                                        ? const Color(0xFF00E676)
-                                        : Colors.grey,
-                                  ),
-                                ),
-                                title: Text(
-                                  peer.friendlyName,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                                subtitle: Text(
-                                  'ID: ${peer.peerId} • RSSI: ${peer.rssi ?? -50} dBm',
-                                  style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                ),
-                                trailing: isConnected
-                                    ? Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 12,
-                                          vertical: 6,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF00E676).withAlpha(38),
-                                          borderRadius: BorderRadius.circular(16),
-                                          border: Border.all(
-                                            color: const Color(0xFF00E676),
-                                            width: 1,
-                                          ),
-                                        ),
-                                        child: const Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Icon(
-                                              Icons.circle,
-                                              size: 8,
-                                              color: Color(0xFF00E676),
-                                            ),
-                                            SizedBox(width: 6),
-                                            Text(
-                                              'Connected',
-                                              style: TextStyle(
-                                                color: Color(0xFF00E676),
-                                                fontSize: 12,
-                                                fontWeight: FontWeight.w600,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      )
-                                    : ElevatedButton(
-                                        style: ElevatedButton.styleFrom(
-                                          backgroundColor: const Color(0xFF00E676),
-                                          foregroundColor: Colors.black,
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 16,
-                                          ),
-                                        ),
-                                        onPressed: () {
-                                          final tConnect = DateTime.now().millisecondsSinceEpoch;
-                                          debugPrint('OMNILINK_DART: [t=$tConnect] connectPeer requested for ${peer.peerId}');
-                                          adapter.connectPeer(peer.peerId);
-                                        },
-                                        child: const Text('Connect'),
-                                      ),
-                                onTap: isConnected
-                                    ? () {
-                                        Navigator.push(
-                                          context,
-                                          MaterialPageRoute(
-                                            builder: (_) => ChatScreen(
-                                              peerId: peer.peerId,
-                                              peerName: peer.friendlyName,
-                                            ),
-                                          ),
-                                        );
-                                      }
-                                    : null,
-                              ),
-                            );
-                          },
-                        ),
-                ),
-              ],
+                  const Spacer(),
+                  IconButton(
+                    icon: Icon(
+                      Icons.tune_rounded,
+                      color: Colors.white.withValues(alpha: 0.7),
+                    ),
+                    onPressed: () {
+                      _showSettingsBottomSheet(context, radioState);
+                    },
+                  ),
+                ],
+              ),
             ),
-      floatingActionButton: FloatingActionButton.extended(
-        backgroundColor: const Color(0xFF00E676),
-        foregroundColor: Colors.black,
-        icon: Icon(_isDiscovering ? Icons.stop_rounded : Icons.radar_rounded),
-        label: Text(_isDiscovering ? 'Stop Discovery' : 'Start Discovery'),
-        onPressed: _toggleDiscovery,
+
+            const SizedBox(height: 8),
+
+            // =================================================================
+            // 2. RADAR VISUALIZATION (HERO AREA)
+            // =================================================================
+            Expanded(
+              flex: 5,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    RadarWidget(
+                      status: discoveryState.status,
+                      peers: discoveryState.discoveredPeers,
+                      connectedPeerName: discoveryState.connectedPeerName,
+                      rttMs: discoveryState.pingPongRttMs,
+                    ),
+                    const SizedBox(height: 20),
+                    // Compact Status Pill Below Radar
+                    _buildStatusPill(radioState, discoveryState),
+                  ],
+                ),
+              ),
+            ),
+
+            // =================================================================
+            // 3. DISCOVERED PEERS LIST & DOMINANT ACTION BUTTON
+            // =================================================================
+            Expanded(
+              flex: 4,
+              child: Column(
+                children: [
+                  // Discovered Peer Cards Stream
+                  if (discoveryState.discoveredPeers.isNotEmpty)
+                    Expanded(
+                      child: ListView.builder(
+                        itemCount: discoveryState.discoveredPeers.length,
+                        itemBuilder: (context, index) {
+                          final peer = discoveryState.discoveredPeers[index];
+                          final isConn = discoveryState.connectedPeerId ==
+                              peer.endpointId;
+                          final isConnState = discoveryState.status ==
+                              DiscoveryStatus.connecting;
+
+                          final activePeers = ref.watch(peerListProvider);
+                          final matchingPeer = activePeers.firstWhere(
+                            (p) => p.peerId == peer.endpointId || p.nodeId == peer.endpointId,
+                            orElse: () => PeerDevice(
+                              peerId: peer.endpointId,
+                              friendlyName: peer.deviceName,
+                              lastSeenAt: DateTime.now(),
+                              connectionStatus: PeerConnectionStatus.discovered,
+                              transportType: 'ANDROID_NEARBY',
+                            ),
+                          );
+                          final targetChatId = (matchingPeer.nodeId != null && matchingPeer.nodeId!.isNotEmpty)
+                              ? matchingPeer.nodeId!
+                              : peer.endpointId;
+                          final peerName = matchingPeer.friendlyName.isNotEmpty
+                              ? matchingPeer.friendlyName
+                              : peer.deviceName;
+
+                          return DiscoveredDeviceCard(
+                            peer: peer,
+                            isConnecting: isConnState && isConn,
+                            isConnected: isConn &&
+                                discoveryState.status ==
+                                    DiscoveryStatus.connected,
+                            onConnect: () {
+                              ref
+                                  .read(discoveryStateProvider.notifier)
+                                  .connectPeer(peer.endpointId);
+                            },
+                            onOpenChat: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => ChatScreen(
+                                    peerId: targetChatId,
+                                    peerName: peerName,
+                                  ),
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    )
+                  else if (discoveryState.status == DiscoveryStatus.discovering)
+                    Expanded(
+                      child: Center(
+                        child: Text(
+                          'Searching for nearby OMNILINK devices...\nKeep discovery active on both phones',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.4),
+                            fontSize: 12,
+                            height: 1.5,
+                          ),
+                        ),
+                      ),
+                    )
+                  else
+                    const Spacer(),
+
+                  // Readiness Accordion (Non-intrusive diagnostics)
+                  ReadinessAccordion(
+                    radioState: radioState,
+                    onToggleBluetooth: _toggleBluetooth,
+                    onToggleWifi: _toggleWifi,
+                    onToggleLocation: _toggleLocation,
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // Dominant Single Action Button
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20.0),
+                    child: SizedBox(
+                      width: double.infinity,
+                      height: 54,
+                      child: ElevatedButton(
+                        onPressed: radioState.isReady
+                            ? () {
+                                ref
+                                    .read(discoveryStateProvider.notifier)
+                                    .toggleDiscovery();
+                              }
+                            : null,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: discoveryState.status ==
+                                  DiscoveryStatus.discovering
+                              ? const Color(0xFFFF5252)
+                              : const Color(0xFF00E676),
+                          disabledBackgroundColor: Colors.white10,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          elevation: 0,
+                        ),
+                        child: Text(
+                          discoveryState.status == DiscoveryStatus.discovering
+                              ? 'STOP DISCOVERY'
+                              : 'START DISCOVERY',
+                          style: TextStyle(
+                            color: radioState.isReady
+                                ? Colors.black
+                                : Colors.white38,
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1.5,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
+    );
+  }
+
+  Widget _buildStatusPill(
+    RadioStatusState radioState,
+    DiscoveryState discoveryState,
+  ) {
+    final String label;
+    final Color color;
+
+    if (discoveryState.status == DiscoveryStatus.connected) {
+      final rttText = discoveryState.pingPongRttMs != null
+          ? '${discoveryState.pingPongRttMs} ms'
+          : 'Measuring...';
+      label =
+          'CONNECTED · ${discoveryState.connectedPeerName ?? "PEER"} ($rttText)';
+      color = const Color(0xFF00E676);
+    } else if (discoveryState.status == DiscoveryStatus.connecting) {
+      label = 'CONNECTING TO PEER...';
+      color = const Color(0xFF29B6F6);
+    } else if (discoveryState.status == DiscoveryStatus.discovering) {
+      label = 'SEARCHING NEARBY';
+      color = const Color(0xFF00E676);
+    } else if (!radioState.isReady) {
+      label = 'DISCOVERY UNAVAILABLE';
+      color = const Color(0xFFFF5252);
+    } else {
+      label = 'READY TO DISCOVER';
+      color = const Color(0xFF00E676);
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.4), width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: color,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: color,
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.0,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSettingsBottomSheet(
+      BuildContext context, RadioStatusState radioState) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF141622),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'OMNILINK Transport Diagnostics',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.bluetooth, color: Colors.white70),
+                title: const Text('Bluetooth Adapter',
+                    style: TextStyle(color: Colors.white)),
+                subtitle: Text(
+                  radioState.bluetoothEnabled ? 'Enabled' : 'Disabled',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                trailing: TextButton(
+                  onPressed: _toggleBluetooth,
+                  child: const Text('Toggle'),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.wifi, color: Colors.white70),
+                title: const Text('Wi-Fi High Speed Link',
+                    style: TextStyle(color: Colors.white)),
+                subtitle: Text(
+                  radioState.wifiEnabled ? 'Enabled' : 'Disabled',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                trailing: TextButton(
+                  onPressed: _toggleWifi,
+                  child: const Text('Toggle'),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.battery_saver, color: Colors.white70),
+                title: const Text('Background Reliability',
+                    style: TextStyle(color: Colors.white)),
+                subtitle: Text(
+                  _batteryOptimizationExempt == true
+                      ? 'Battery optimization exempt'
+                      : 'Battery optimization may pause the mesh',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                trailing: TextButton(
+                  onPressed: _batteryOptimizationExempt == true
+                      ? null
+                      : _requestBatteryExemption,
+                  child: Text(
+                    _batteryOptimizationExempt == true ? 'Ready' : 'Allow',
+                  ),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.notifications_active,
+                    color: Colors.white70),
+                title: const Text('Message Notifications',
+                    style: TextStyle(color: Colors.white)),
+                subtitle: Text(
+                  _notificationPermissionGranted == true
+                      ? 'Enabled'
+                      : 'Disabled - incoming messages stay silent',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                trailing: TextButton(
+                  onPressed: _notificationPermissionGranted == true
+                      ? null
+                      : _requestNotificationPermission,
+                  child: Text(
+                    _notificationPermissionGranted == true ? 'Ready' : 'Enable',
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
